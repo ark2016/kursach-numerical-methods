@@ -1,1 +1,1 @@
-# kursach-numerical-methods
+# kursach-emotion
