@@ -41,7 +41,7 @@ CONFIG = {
 
     # Baseline sklearn SVM
     "run_sklearn_baseline": True,
-    "sklearn_svm_C_values": [0.1, 1.0, 10.0],  # Разные значения C для LinearSVC
+    "sklearn_svm_C_values": [0.1, 1.0],  # Разные значения C для LinearSVC
     "use_scaler": True,  # StandardScaler перед sklearn SVM
 
     # Metrics @k settings

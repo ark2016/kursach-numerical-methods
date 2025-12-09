@@ -56,7 +56,7 @@ CONFIG = {
     "C_neg_base": 2.0,
 
     # Sklearn baseline settings
-    "sklearn_svm_C_values": [0.1, 1.0, 10.0],
+    "sklearn_svm_C_values": [0.1, 1.0],
     "use_scaler": True,
 
     # Metrics @k settings
