@@ -100,9 +100,9 @@ def compute_bleu_score(reference_texts: list[str], hypothesis_texts: list[str],
             score = sentence_bleu(refs, hyp, smoothing_function=smoothing)
             bleu_scores.append(score)
 
-        results["bleu_mean"] = np.mean(bleu_scores)
-        results["bleu_std"] = np.std(bleu_scores)
-        results["bleu_median"] = np.median(bleu_scores)
+        results["bleu_mean"] = float(np.mean(bleu_scores))
+        results["bleu_std"] = float(np.std(bleu_scores))
+        results["bleu_median"] = float(np.median(bleu_scores))
     else:
         # Простая реализация BLEU без nltk
         results["bleu_mean"] = compute_simple_bleu(ref_tokenized, hyp_tokenized, max_n)
@@ -199,7 +199,7 @@ def compute_rouge_scores(reference_texts: list[str], hypothesis_texts: list[str]
             results["rougeL_fmeasure"].append(best_scores["rougeL"].fmeasure)
 
     # Усредняем
-    return {k: np.mean(v) for k, v in results.items()}
+    return {k: float(np.mean(v)) for k, v in results.items()}
 
 
 def compute_vocabulary_overlap(texts1: list[str], texts2: list[str]) -> dict:
@@ -270,7 +270,7 @@ def compute_self_bleu(texts: list[str], sample_size: int = 500, num_refs: int = 
 
         scores.append(score)
 
-    return np.mean(scores)
+    return float(np.mean(scores))
 
 
 def compute_length_statistics(texts: list[str]) -> dict:
@@ -279,12 +279,27 @@ def compute_length_statistics(texts: list[str]) -> dict:
     lengths = [len(tokenize(text)) for text in texts]
 
     return {
-        "mean_length": np.mean(lengths),
-        "std_length": np.std(lengths),
-        "min_length": np.min(lengths),
-        "max_length": np.max(lengths),
-        "median_length": np.median(lengths),
+        "mean_length": float(np.mean(lengths)),
+        "std_length": float(np.std(lengths)),
+        "min_length": int(np.min(lengths)),
+        "max_length": int(np.max(lengths)),
+        "median_length": float(np.median(lengths)),
     }
+
+
+def convert_numpy_types(obj):
+    """Рекурсивно конвертирует numpy типы в нативные Python типы."""
+    if isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
 
 
 def analyze_datasets_similarity(
@@ -372,8 +387,10 @@ def analyze_datasets_similarity(
 
     # Сохраняем результаты
     if output_file:
+        # Конвертируем numpy типы в нативные Python типы
+        results_converted = convert_numpy_types(results)
         with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
+            json.dump(results_converted, f, indent=2, ensure_ascii=False)
         print(f"\nResults saved to {output_file}")
 
     return results
