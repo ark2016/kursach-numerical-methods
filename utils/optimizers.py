@@ -1,8 +1,3 @@
-"""
-Кастомные реализации оптимизаторов.
-AdamW - Adam с правильным weight decay (decoupled weight decay).
-"""
-
 import torch
 from torch.optim import Optimizer
 from typing import Iterable, Callable, Optional

@@ -1,7 +1,3 @@
-"""
-Утилиты для проекта эмоциональной классификации.
-"""
-
 from .label_mapping import (
     GO_EMOTIONS_LABELS,
     IZARD_EMOTIONS_LABELS,
