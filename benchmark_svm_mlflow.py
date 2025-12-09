@@ -252,7 +252,7 @@ def train_sklearn_baselines(X_train, y_train, X_test, y_test, target_names_str, 
                 metrics_at_k = compute_all_metrics_at_k(y_test_np, y_scores, k_values=CONFIG["k_values"])
                 metrics.update(metrics_at_k)
 
-                print(f"    {clf_name}: F1_micro={metrics['f1_micro']:.4f}, F1_macro={metrics['f1_macro']:.4f}, MAP@5={metrics.get('map@5', 0):.4f}")
+                print(f"    {clf_name}: F1_micro={metrics['f1_micro']:.4f}, F1_macro={metrics['f1_macro']:.4f}, MAP@5={metrics.get('map_at_5', 0):.4f}")
 
                 mlflow.log_metrics(metrics)
 
@@ -376,8 +376,8 @@ def main():
 
             print(f"CS-SVM Results for {model_friendly_name}:")
             print(f"  F1_micro={metrics['f1_micro']:.4f}, F1_macro={metrics['f1_macro']:.4f}")
-            print(f"  Precision@5={metrics.get('precision@5', 0):.4f}, MAP@5={metrics.get('map@5', 0):.4f}")
-            print(f"  NDCG@5={metrics.get('ndcg@5', 0):.4f}, Hit_Rate@5={metrics.get('hit_rate@5', 0):.4f}")
+            print(f"  Precision@5={metrics.get('precision_at_5', 0):.4f}, MAP@5={metrics.get('map_at_5', 0):.4f}")
+            print(f"  NDCG@5={metrics.get('ndcg_at_5', 0):.4f}, Hit_Rate@5={metrics.get('hit_rate_at_5', 0):.4f}")
 
             mlflow.log_metrics(metrics)
             torch.save(svm.state_dict(), "svm_model.pt")
@@ -409,7 +409,7 @@ def main():
     print(f"{'Model':<40} {'F1_micro':<10} {'F1_macro':<10} {'MAP@5':<10} {'NDCG@5':<10}")
     print("-"*80)
     for name, m in all_results.items():
-        print(f"{name:<40} {m['f1_micro']:<10.4f} {m['f1_macro']:<10.4f} {m.get('map@5', 0):<10.4f} {m.get('ndcg@5', 0):<10.4f}")
+        print(f"{name:<40} {m['f1_micro']:<10.4f} {m['f1_macro']:<10.4f} {m.get('map_at_5', 0):<10.4f} {m.get('ndcg_at_5', 0):<10.4f}")
 
 if __name__ == "__main__":
     main()

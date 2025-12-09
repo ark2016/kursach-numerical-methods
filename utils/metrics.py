@@ -247,12 +247,12 @@ def compute_all_metrics_at_k(
         if k > y_scores.shape[1]:
             continue
 
-        results[f"precision@{k}"] = precision_at_k(y_true, y_scores, k)
-        results[f"recall@{k}"] = recall_at_k(y_true, y_scores, k)
-        results[f"f1@{k}"] = f1_at_k(y_true, y_scores, k)
-        results[f"map@{k}"] = map_at_k(y_true, y_scores, k)
-        results[f"ndcg@{k}"] = ndcg_at_k(y_true, y_scores, k)
-        results[f"hit_rate@{k}"] = hit_rate_at_k(y_true, y_scores, k)
+        results[f"precision_at_{k}"] = precision_at_k(y_true, y_scores, k)
+        results[f"recall_at_{k}"] = recall_at_k(y_true, y_scores, k)
+        results[f"f1_at_{k}"] = f1_at_k(y_true, y_scores, k)
+        results[f"map_at_{k}"] = map_at_k(y_true, y_scores, k)
+        results[f"ndcg_at_{k}"] = ndcg_at_k(y_true, y_scores, k)
+        results[f"hit_rate_at_{k}"] = hit_rate_at_k(y_true, y_scores, k)
 
     return results
 

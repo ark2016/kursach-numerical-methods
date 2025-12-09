@@ -697,7 +697,7 @@ def main():
         if "svm_results" in report:
             for clf_name, metrics in report["svm_results"].items():
                 full_name = f"{model_name}_{clf_name}"
-                print(f"{full_name:<45} {metrics['f1_micro']:<10.4f} {metrics['f1_macro']:<10.4f} {metrics.get('map@5', 0):<10.4f}")
+                print(f"{full_name:<45} {metrics['f1_micro']:<10.4f} {metrics['f1_macro']:<10.4f} {metrics.get('map_at_5', 0):<10.4f}")
 
     # Сохраняем общий отчёт
     with open("drift_analysis_summary.json", "w") as f:
