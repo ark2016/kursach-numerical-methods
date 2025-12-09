@@ -1,0 +1,38 @@
+Encoder: fyaronskiy/ruRoberta-large-ru-go-emotions
+Classifier: SGD_hinge
+
+                precision    recall  f1-score   support
+
+    admiration       0.61      0.38      0.47       504
+     amusement       0.72      0.57      0.64       264
+         anger       0.36      0.21      0.26       198
+     annoyance       0.21      0.01      0.02       320
+      approval       0.56      0.10      0.17       351
+        caring       0.26      0.13      0.18       135
+     confusion       0.26      0.27      0.27       153
+     curiosity       0.44      0.36      0.40       284
+        desire       0.45      0.27      0.33        83
+disappointment       0.10      0.05      0.07       151
+   disapproval       0.24      0.19      0.22       267
+       disgust       0.31      0.15      0.21       123
+ embarrassment       0.00      0.00      0.00        37
+    excitement       0.27      0.17      0.21       103
+          fear       0.35      0.23      0.28        78
+     gratitude       0.88      0.83      0.85       352
+         grief       0.00      0.00      0.00         6
+           joy       0.42      0.35      0.38       161
+          love       0.77      0.68      0.72       238
+   nervousness       0.00      0.00      0.00        23
+      optimism       0.44      0.24      0.31       186
+         pride       0.00      0.00      0.00        16
+   realization       0.19      0.08      0.11       145
+        relief       0.00      0.00      0.00        11
+       remorse       0.48      0.39      0.43        56
+       sadness       0.39      0.28      0.33       156
+      surprise       0.33      0.18      0.23       141
+       neutral       0.56      0.63      0.59      1787
+
+     micro avg       0.52      0.40      0.45      6329
+     macro avg       0.34      0.24      0.27      6329
+  weighted avg       0.48      0.40      0.42      6329
+   samples avg       0.41      0.42      0.40      6329
