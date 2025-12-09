@@ -150,16 +150,3 @@ def get_mapping_matrix():
 
     return matrix
 
-
-if __name__ == "__main__":
-    # Тест маппинга
-    print("GO_EMOTIONS_LABELS (28):", GO_EMOTIONS_LABELS)
-    print("\nIZARD_EMOTIONS_LABELS (10):", IZARD_EMOTIONS_LABELS)
-    print("\nMapping matrix shape:", get_mapping_matrix().shape)
-
-    # Пример конвертации
-    test_binary = [0] * 28
-    test_binary[GO_EMOTIONS_LABELS.index("joy")] = 1
-    test_binary[GO_EMOTIONS_LABELS.index("excitement")] = 1
-    print(f"\nTest: joy + excitement -> {convert_go_emotions_binary_to_izard(test_binary)}")
-    print(f"Expected: joy=1, enthusiasm=1")

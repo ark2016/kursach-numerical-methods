@@ -15,15 +15,7 @@ from typing import Union
 
 def precision_at_k(y_true: np.ndarray, y_scores: np.ndarray, k: int) -> float:
     """
-    Precision@k: доля релевантных меток среди top-k предсказанных.
-
-    Args:
-        y_true: Бинарная матрица истинных меток (n_samples, n_classes)
-        y_scores: Матрица скоров/вероятностей (n_samples, n_classes)
-        k: Количество top меток для рассмотрения
-
-    Returns:
-        Среднее значение Precision@k по всем samples
+    Precision@k
     """
     n_samples = y_true.shape[0]
     precisions = []
@@ -40,15 +32,7 @@ def precision_at_k(y_true: np.ndarray, y_scores: np.ndarray, k: int) -> float:
 
 def recall_at_k(y_true: np.ndarray, y_scores: np.ndarray, k: int) -> float:
     """
-    Recall@k: доля найденных релевантных меток среди всех релевантных.
-
-    Args:
-        y_true: Бинарная матрица истинных меток (n_samples, n_classes)
-        y_scores: Матрица скоров/вероятностей (n_samples, n_classes)
-        k: Количество top меток для рассмотрения
-
-    Returns:
-        Среднее значение Recall@k по всем samples
+    Recall@k
     """
     n_samples = y_true.shape[0]
     recalls = []
@@ -82,14 +66,6 @@ def average_precision_at_k(y_true: np.ndarray, y_scores: np.ndarray, k: int) -> 
     """
     Average Precision@k для одного sample.
     AP@k = (1/min(k, |relevant|)) * sum_{i=1}^{k} P@i * rel(i)
-
-    Args:
-        y_true: Бинарный вектор истинных меток (n_classes,)
-        y_scores: Вектор скоров (n_classes,)
-        k: Количество top меток
-
-    Returns:
-        AP@k для данного sample
     """
     n_relevant = np.sum(y_true)
     if n_relevant == 0:
@@ -111,14 +87,6 @@ def average_precision_at_k(y_true: np.ndarray, y_scores: np.ndarray, k: int) -> 
 def map_at_k(y_true: np.ndarray, y_scores: np.ndarray, k: int) -> float:
     """
     Mean Average Precision@k: среднее AP@k по всем samples.
-
-    Args:
-        y_true: Бинарная матрица истинных меток (n_samples, n_classes)
-        y_scores: Матрица скоров/вероятностей (n_samples, n_classes)
-        k: Количество top меток
-
-    Returns:
-        MAP@k
     """
     n_samples = y_true.shape[0]
     ap_scores = []
@@ -133,14 +101,6 @@ def dcg_at_k(y_true: np.ndarray, y_scores: np.ndarray, k: int) -> float:
     """
     Discounted Cumulative Gain@k для одного sample.
     DCG@k = sum_{i=1}^{k} rel(i) / log2(i + 1)
-
-    Args:
-        y_true: Бинарный вектор истинных меток (n_classes,)
-        y_scores: Вектор скоров (n_classes,)
-        k: Количество top меток
-
-    Returns:
-        DCG@k
     """
     sorted_indices = np.argsort(y_scores)[::-1][:k]
     dcg = 0.0
@@ -155,14 +115,6 @@ def dcg_at_k(y_true: np.ndarray, y_scores: np.ndarray, k: int) -> float:
 def ndcg_at_k(y_true: np.ndarray, y_scores: np.ndarray, k: int) -> float:
     """
     Normalized Discounted Cumulative Gain@k: нормализованный DCG.
-
-    Args:
-        y_true: Бинарная матрица истинных меток (n_samples, n_classes)
-        y_scores: Матрица скоров/вероятностей (n_samples, n_classes)
-        k: Количество top меток
-
-    Returns:
-        NDCG@k (среднее по всем samples)
     """
     n_samples = y_true.shape[0]
     ndcg_scores = []
@@ -183,14 +135,6 @@ def ndcg_at_k(y_true: np.ndarray, y_scores: np.ndarray, k: int) -> float:
 def hit_rate_at_k(y_true: np.ndarray, y_scores: np.ndarray, k: int) -> float:
     """
     Hit Rate@k: доля samples, для которых хотя бы одна релевантная метка попала в top-k.
-
-    Args:
-        y_true: Бинарная матрица истинных меток (n_samples, n_classes)
-        y_scores: Матрица скоров/вероятностей (n_samples, n_classes)
-        k: Количество top меток
-
-    Returns:
-        Hit Rate@k
     """
     n_samples = y_true.shape[0]
     hits = 0
@@ -206,14 +150,6 @@ def hit_rate_at_k(y_true: np.ndarray, y_scores: np.ndarray, k: int) -> float:
 def coverage_at_k(y_true: np.ndarray, y_scores: np.ndarray, k: int) -> float:
     """
     Coverage@k: доля уникальных классов, которые появились в top-k хотя бы для одного sample.
-
-    Args:
-        y_true: Бинарная матрица истинных меток (n_samples, n_classes)
-        y_scores: Матрица скоров/вероятностей (n_samples, n_classes)
-        k: Количество top меток
-
-    Returns:
-        Coverage@k
     """
     n_samples, n_classes = y_scores.shape
     covered_classes = set()
@@ -232,14 +168,6 @@ def compute_all_metrics_at_k(
 ) -> dict:
     """
     Вычисляет все метрики @k для заданных значений k.
-
-    Args:
-        y_true: Бинарная матрица истинных меток (n_samples, n_classes)
-        y_scores: Матрица скоров/вероятностей (n_samples, n_classes)
-        k_values: Список значений k
-
-    Returns:
-        Словарь с метриками
     """
     results = {}
 
@@ -257,17 +185,3 @@ def compute_all_metrics_at_k(
     return results
 
 
-if __name__ == "__main__":
-    # Тест метрик
-    np.random.seed(42)
-
-    # Пример данных
-    n_samples, n_classes = 100, 10
-    y_true = np.random.randint(0, 2, (n_samples, n_classes))
-    y_scores = np.random.rand(n_samples, n_classes)
-
-    print("Testing metrics @k:")
-    metrics = compute_all_metrics_at_k(y_true, y_scores, k_values=[1, 3, 5])
-
-    for name, value in metrics.items():
-        print(f"  {name}: {value:.4f}")
