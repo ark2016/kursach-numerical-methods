@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 import torch.nn as nn
 import numpy as np
@@ -7,14 +8,21 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
 from sklearn.metrics import f1_score, accuracy_score, classification_report
 from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.svm import LinearSVC
+from sklearn.linear_model import SGDClassifier
+from sklearn.multiclass import OneVsRestClassifier
+from sklearn.preprocessing import StandardScaler
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 from peft import PeftModel, PeftConfig
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from utils.metrics import compute_all_metrics_at_k
+from utils.optimizers import AdamW as CustomAdamW
 
 # --- КОНФИГУРАЦИЯ ---
 CONFIG = {
     "dataset_name": "seara/ru_go_emotions",
-    "batch_size_embed": 64, 
+    "batch_size_embed": 64,
     "batch_size_svm": 256,
     "max_len": 128,
     "svm_lr": 0.005,
@@ -22,8 +30,21 @@ CONFIG = {
     "C_reg": 0.01,
     "C_neg_base": 2.0,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "cache_dir": "./embeddings_cache", 
-    
+    "cache_dir": "./embeddings_cache",
+
+    # Optimizer settings
+    "use_custom_adamw": True,
+    "adamw_weight_decay": 0.01,
+    "adamw_betas": (0.9, 0.999),
+
+    # Baseline sklearn SVM
+    "run_sklearn_baseline": True,
+    "sklearn_svm_C_values": [0.1, 1.0],  # Разные значения C для LinearSVC
+    "use_scaler": True,  # StandardScaler перед sklearn SVM
+
+    # Metrics @k settings
+    "k_values": [1, 3, 5, 10],
+
     # MLFLOW Settings
     "mlflow_tracking_uri": "http://localhost:5000",
     "experiment_name": "Encoder_Comparison_CS_SVM",
@@ -151,8 +172,80 @@ def get_embeddings(model_key, model_path, dataset, mlb):
     torch.cuda.empty_cache()
     return X_train, y_train, X_test, y_test
 
+def train_sklearn_baselines(X_train, y_train, X_test, y_test, target_names_str, encoder_name):
+    print(f"\n--- Training sklearn baselines for {encoder_name} ---")
+    X_train_np = X_train.numpy() if isinstance(X_train, torch.Tensor) else X_train
+    X_test_np = X_test.numpy() if isinstance(X_test, torch.Tensor) else X_test
+    y_train_np = y_train.numpy() if isinstance(y_train, torch.Tensor) else y_train
+    y_test_np = y_test.numpy() if isinstance(y_test, torch.Tensor) else y_test
+
+    if CONFIG["use_scaler"]:
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train_np)
+        X_test_scaled = scaler.transform(X_test_np)
+    else:
+        X_train_scaled = X_train_np
+        X_test_scaled = X_test_np
+
+    classifiers = []
+
+    for C in CONFIG["sklearn_svm_C_values"]:
+        classifiers.append((
+            f"LinearSVC_C{C}",
+            LinearSVC(C=C, max_iter=10000, dual='auto')
+        ))
+
+    classifiers.extend([
+        ("SGD_hinge", SGDClassifier(loss='hinge', alpha=0.0001, max_iter=1000, n_jobs=-1, random_state=42)),
+        ("SGD_log", SGDClassifier(loss='log_loss', alpha=0.0001, max_iter=1000, n_jobs=-1, random_state=42)),
+    ])
+
+    all_baseline_results = {}
+
+    for clf_name, base_clf in classifiers:
+        print(f"\n  Training {clf_name}...")
+        with mlflow.start_run(run_name=f"sklearn_{clf_name}_on_{encoder_name}"):
+            mlflow.log_param("encoder_model", encoder_name)
+            mlflow.log_param("classifier", clf_name)
+            mlflow.log_param("use_scaler", CONFIG["use_scaler"])
+            clf = OneVsRestClassifier(base_clf, n_jobs=-1)
+            try:
+                clf.fit(X_train_scaled, y_train_np)
+                y_pred = clf.predict(X_test_scaled)
+                try:
+                    y_scores = clf.decision_function(X_test_scaled)
+                except AttributeError:
+                    try:
+                        y_scores = clf.predict_proba(X_test_scaled)
+                    except AttributeError:
+                        y_scores = y_pred.astype(float)
+                metrics = {
+                    "f1_micro": f1_score(y_test_np, y_pred, average='micro'),
+                    "f1_macro": f1_score(y_test_np, y_pred, average='macro'),
+                    "f1_weighted": f1_score(y_test_np, y_pred, average='weighted'),
+                    "accuracy": accuracy_score(y_test_np, y_pred)
+                }
+                metrics_at_k = compute_all_metrics_at_k(y_test_np, y_scores, k_values=CONFIG["k_values"])
+                metrics.update(metrics_at_k)
+                print(f"    {clf_name}: F1_micro={metrics['f1_micro']:.4f}, F1_macro={metrics['f1_macro']:.4f}, MAP@5={metrics.get('map_at_5', 0):.4f}")
+                mlflow.log_metrics(metrics)
+                report = classification_report(y_test_np, y_pred, target_names=target_names_str, zero_division=0)
+                report_filename = f"sklearn_{clf_name}_report.txt"
+                with open(report_filename, "w") as f:
+                    f.write(f"Encoder: {encoder_name}\nClassifier: {clf_name}\n\n")
+                    f.write(report)
+                mlflow.log_artifact(report_filename)
+                all_baseline_results[f"sklearn_{clf_name}"] = metrics
+            except Exception as e:
+                print(f"    Error training {clf_name}: {e}")
+                continue
+
+    return all_baseline_results
+
+
 def main():
     print(f"Start Benchmark. Device: {CONFIG['device']}")
+    print(f"Using custom AdamW: {CONFIG['use_custom_adamw']}")
     ds = load_dataset(CONFIG['dataset_name'], "simplified")
     all_labels = set()
     for split in ds.keys():
@@ -166,20 +259,22 @@ def main():
     except:
         print("Class names not found, using IDs.")
         target_names_str = [str(l) for l in label_list]
-
     mlb = MultiLabelBinarizer(classes=label_list)
     mlb.fit([label_list])
     mlflow.set_experiment(CONFIG["experiment_name"])
-    
+    all_results = {}
     for model_friendly_name, model_path in MODELS.items():
         print(f"\n{'='*40}")
         print(f"Processing: {model_friendly_name}")
         print(f"{'='*40}")
         X_train, y_train, X_test, y_test = get_embeddings(model_friendly_name, model_path, ds, mlb)
         input_dim = X_train.shape[1]
-        with mlflow.start_run(run_name=f"SVM_on_{model_friendly_name}"):
+        with mlflow.start_run(run_name=f"CS_SVM_on_{model_friendly_name}"):
             mlflow.log_param("encoder_model", model_path)
             mlflow.log_param("svm_c_reg", CONFIG["C_reg"])
+            mlflow.log_param("optimizer", "custom_AdamW" if CONFIG["use_custom_adamw"] else "torch_AdamW")
+            mlflow.log_param("lr", CONFIG["svm_lr"])
+            mlflow.log_param("weight_decay", CONFIG["adamw_weight_decay"])
             class_counts = y_train.sum(dim=0).to(CONFIG['device'])
             svm = MultilabelCSSVM(
                 input_dim=input_dim,
@@ -189,9 +284,22 @@ def main():
                 C_reg=CONFIG['C_reg'],
                 C_neg_base=CONFIG['C_neg_base']
             ).to(CONFIG['device'])
-            optimizer = torch.optim.AdamW(svm.parameters(), lr=CONFIG['svm_lr'])
+            if CONFIG["use_custom_adamw"]:
+                optimizer = CustomAdamW(
+                    svm.parameters(),
+                    lr=CONFIG['svm_lr'],
+                    weight_decay=CONFIG["adamw_weight_decay"],
+                    betas=CONFIG["adamw_betas"]
+                )
+            else:
+                optimizer = torch.optim.AdamW(
+                    svm.parameters(),
+                    lr=CONFIG['svm_lr'],
+                    weight_decay=CONFIG["adamw_weight_decay"],
+                    betas=CONFIG["adamw_betas"]
+                )
             train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=CONFIG['batch_size_svm'], shuffle=True)
-            print("Training SVM...")
+            print("Training CS-SVM...")
             svm.train()
             for epoch in range(CONFIG["svm_epochs"]):
                 total_loss = 0
@@ -206,26 +314,48 @@ def main():
                 mlflow.log_metric("train_loss", avg_loss, step=epoch)
                 if (epoch+1) % 5 == 0:
                     print(f"Epoch {epoch+1}: Loss {avg_loss:.4f}")
-            print("Evaluating...")
+            print("Evaluating CS-SVM...")
             svm.eval()
             with torch.no_grad():
                 test_logits = svm(X_test.to(CONFIG['device'])).cpu()
                 pred_bin = (test_logits > 0).float().numpy()
+                y_scores = test_logits.numpy()
                 y_true = y_test.numpy()
             metrics = {
                 "f1_micro": f1_score(y_true, pred_bin, average='micro'),
                 "f1_macro": f1_score(y_true, pred_bin, average='macro'),
                 "accuracy": accuracy_score(y_true, pred_bin)
             }
-            print(f"Results for {model_friendly_name}: {metrics}")
+            metrics_at_k = compute_all_metrics_at_k(y_true, y_scores, k_values=CONFIG["k_values"])
+            metrics.update(metrics_at_k)
+            print(f"CS-SVM Results for {model_friendly_name}:")
+            print(f"  F1_micro={metrics['f1_micro']:.4f}, F1_macro={metrics['f1_macro']:.4f}")
+            print(f"  Precision@5={metrics.get('precision_at_5', 0):.4f}, MAP@5={metrics.get('map_at_5', 0):.4f}")
+            print(f"  NDCG@5={metrics.get('ndcg_at_5', 0):.4f}, Hit_Rate@5={metrics.get('hit_rate_at_5', 0):.4f}")
             mlflow.log_metrics(metrics)
             torch.save(svm.state_dict(), "svm_model.pt")
             mlflow.log_artifact("svm_model.pt")
             report = classification_report(y_true, pred_bin, target_names=target_names_str, zero_division=0)
             with open("classification_report.txt", "w") as f:
+                f.write(f"Encoder: {model_friendly_name}\nOptimizer: {'custom' if CONFIG['use_custom_adamw'] else 'torch'} AdamW\n\n")
                 f.write(report)
             mlflow.log_artifact("classification_report.txt")
-            print(f"Run for {model_friendly_name} completed.")
+            all_results[f"CS_SVM_{model_friendly_name}"] = metrics
+            print(f"CS-SVM run for {model_friendly_name} completed.")
+        if CONFIG["run_sklearn_baseline"]:
+            sklearn_results = train_sklearn_baselines(
+                X_train, y_train, X_test, y_test,
+                target_names_str, model_friendly_name
+            )
+            for clf_name, metrics in sklearn_results.items():
+                all_results[f"{clf_name}_{model_friendly_name}"] = metrics
+    print("\n" + "="*80)
+    print("SUMMARY - All Results")
+    print("="*80)
+    print(f"{'Model':<40} {'F1_micro':<10} {'F1_macro':<10} {'MAP@5':<10} {'NDCG@5':<10}")
+    print("-"*80)
+    for name, m in all_results.items():
+        print(f"{name:<40} {m['f1_micro']:<10.4f} {m['f1_macro']:<10.4f} {m.get('map_at_5', 0):<10.4f} {m.get('ndcg_at_5', 0):<10.4f}")
 
 if __name__ == "__main__":
     main()

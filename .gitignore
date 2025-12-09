@@ -4,3 +4,5 @@ mlflow_data/
 rubert_large_lora_results/
 classification_report.txt
 *.pt
+__pycache__/
+.*/

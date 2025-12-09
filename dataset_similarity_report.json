@@ -1,0 +1,53 @@
+{
+  "dataset1": "seara/ru_go_emotions",
+  "dataset2": "Djacon/ru-izard-emotions",
+  "split": "train",
+  "dataset1_size": 43410,
+  "dataset2_size": 20162,
+  "dataset1_length_stats": {
+    "mean_length": 15.645496429394148,
+    "std_length": 7.802458493809148,
+    "min_length": 1,
+    "max_length": 47,
+    "median_length": 15.0
+  },
+  "dataset2_length_stats": {
+    "mean_length": 15.767780974109712,
+    "std_length": 8.164544886343029,
+    "min_length": 1,
+    "max_length": 69,
+    "median_length": 15.0
+  },
+  "vocabulary": {
+    "vocab_size_1": 35470,
+    "vocab_size_2": 40968,
+    "intersection_size": 3235,
+    "union_size": 73203,
+    "jaccard_similarity": 0.04419217791620562,
+    "overlap_ratio_1": 0.09120383422610658,
+    "overlap_ratio_2": 0.07896406951767233
+  },
+  "bleu_ds1_to_ds2": {
+    "bleu_mean": 0.030095285543980034,
+    "bleu_std": 0.04378292048987602,
+    "bleu_median": 0.01618861356572822
+  },
+  "bleu_ds2_to_ds1": {
+    "bleu_mean": 0.03194558508415559,
+    "bleu_std": 0.051040144639760025,
+    "bleu_median": 0.014400124446705301
+  },
+  "rouge": {
+    "rouge1_precision": 0.09949191919191919,
+    "rouge1_recall": 0.027699251508295625,
+    "rouge1_fmeasure": 0.04127665170475623,
+    "rouge2_precision": 0.00012698412698412698,
+    "rouge2_recall": 0.00016666666666666666,
+    "rouge2_fmeasure": 0.00013852813852813852,
+    "rougeL_precision": 0.09947108585858587,
+    "rougeL_recall": 0.02767925150829563,
+    "rougeL_fmeasure": 0.04125624354149093
+  },
+  "self_bleu_ds1": 0.07792379481377909,
+  "self_bleu_ds2": 0.08008429288636597
+}
