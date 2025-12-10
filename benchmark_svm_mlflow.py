@@ -1,10 +1,8 @@
 import os
 import sys
 import torch
-import torch.nn as nn
 import numpy as np
 import mlflow
-from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
 from sklearn.metrics import f1_score, accuracy_score, classification_report
 from sklearn.preprocessing import MultiLabelBinarizer
@@ -15,27 +13,30 @@ from sklearn.preprocessing import StandardScaler
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 from peft import PeftModel, PeftConfig
+import cvxopt
+from cvxopt import matrix, solvers
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.metrics import compute_all_metrics_at_k
-from utils.optimizers import AdamW as CustomAdamW
+
+# Отключаем вывод cvxopt
+solvers.options['show_progress'] = False
 
 # --- КОНФИГУРАЦИЯ ---
 CONFIG = {
     "dataset_name": "seara/ru_go_emotions",
     "batch_size_embed": 64,
-    "batch_size_svm": 256,
     "max_len": 128,
-    "svm_lr": 0.005,
-    "svm_epochs": 20,
-    "C_reg": 0.01,
-    "C_neg_base": 2.0,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "cache_dir": "./embeddings_cache",
 
-    # Optimizer settings
-    "use_custom_adamw": True,
-    "adamw_weight_decay": 0.01,
-    "adamw_betas": (0.9, 0.999),
+    # CS-SVM параметры согласно статье (уравнения 49-51)
+    # C - параметр регуляризации (slack penalty)
+    # C_1 - стоимость ошибки на положительном классе (false negative)
+    # C_{-1} - стоимость ошибки на отрицательном классе (false positive)
+    # κ = 1/(2*C_{-1} - 1), условие: C_{-1} >= 1, C_1 >= 2*C_{-1} - 1
+    "C_slack": 1.0,       # Параметр C (slack penalty)
+    "C_pos": 3.0,         # C_1: стоимость FN (должно быть >= 2*C_neg - 1)
+    "C_neg": 2.0,         # C_{-1}: стоимость FP (должно быть >= 1)
 
     # Baseline sklearn SVM
     "run_sklearn_baseline": True,
@@ -47,7 +48,7 @@ CONFIG = {
 
     # MLFLOW Settings
     "mlflow_tracking_uri": "http://localhost:5000",
-    "experiment_name": "Encoder_Comparison_CS_SVM",
+    "experiment_name": "Encoder_Comparison_CS_SVM_QP",
     "s3_endpoint": "http://localhost:9000",
     "s3_access_key": "minio_root",
     "s3_secret_key": "minio_password"
@@ -58,7 +59,8 @@ MODELS = {
     "Baseline_ruBert": "ai-forever/ruBert-large",
     "Foreign_ruRoberta": "fyaronskiy/ruRoberta-large-ru-go-emotions",
     "My_LoRA_Ark2016": "Ark2016/ruBert-large-emotions-lora",
-    "fyaronskiy/ruRoberta-large-ru-go-emotions": "fyaronskiy/ruRoberta-large-ru-go-emotions"
+    # Повторяющаяся модель (дубликат Foreign_ruRoberta)
+    # "fyaronskiy/ruRoberta-large-ru-go-emotions": "fyaronskiy/ruRoberta-large-ru-go-emotions"
 }
 
 # Настройка окружения для MLFlow/Boto3
@@ -72,37 +74,252 @@ os.environ["MLFLOW_S3_IGNORE_TLS"] = "true"
 # Создаем папку для кэша
 os.makedirs(CONFIG["cache_dir"], exist_ok=True)
 
-class MultilabelCSSVM(nn.Module):
-    def __init__(self, input_dim, num_classes, class_counts, total_samples, C_reg, C_neg_base=2.0):
-        super().__init__()
-        self.C_reg = C_reg
-        self.w = nn.Parameter(torch.randn(input_dim, num_classes) * np.sqrt(2.0 / (input_dim + num_classes)))
-        self.b = nn.Parameter(torch.zeros(num_classes))
-        self.C_neg = C_neg_base 
-        self.kappa = 1.0 / (2 * self.C_neg - 1)
+class BinaryCSSVM_QP:
+    """
+    Бинарный Cost-Sensitive SVM с оптимизацией через двойственную задачу (QP).
+
+    Реализация строго по статье "Cost-sensitive Support Vector Machines"
+    (Masnadi-Shirazi et al., arXiv:1212.0975v2)
+
+    Прималь (уравнение 49):
+        min_{w,b,ξ} 1/2 ||w||² + C[C₁ Σ_{y_i=1} ξ_i + (1/κ) Σ_{y_i=-1} ξ_i]
+        s.t. (w^T x_i + b) ≥ 1 - ξ_i    ; y_i = +1
+             (w^T x_i + b) ≤ -κ + ξ_i   ; y_i = -1
+
+    Дуаль (уравнение 51):
+        max_α Σ_i α_i[(y_i+1)/2 - κ(y_i-1)/2] - 1/2 Σ_i Σ_j α_i α_j y_i y_j K(x_i,x_j)
+        s.t. Σ_i α_i y_i = 0
+             0 ≤ α_i ≤ C·C₁   ; y_i = +1
+             0 ≤ α_i ≤ C/κ    ; y_i = -1
+
+    где κ = 1/(2C_{-1} - 1), условия: C_{-1} ≥ 1, C₁ ≥ 2C_{-1} - 1
+    """
+
+    def __init__(self, C_slack=1.0, C_pos=3.0, C_neg=2.0):
+        """
+        Args:
+            C_slack: Параметр регуляризации C (slack penalty)
+            C_pos: C₁ - стоимость ошибки на положительном классе (false negative)
+            C_neg: C_{-1} - стоимость ошибки на отрицательном классе (false positive)
+        """
+        # Проверка условий из статьи (уравнение 50)
+        assert C_neg >= 1.0, f"C_neg должно быть >= 1, получено {C_neg}"
+        min_c_pos = 2 * C_neg - 1
+        assert C_pos >= min_c_pos, f"C_pos должно быть >= {min_c_pos}, получено {C_pos}"
+
+        self.C = C_slack
+        self.C_pos = C_pos  # C₁
+        self.C_neg = C_neg  # C_{-1}
+
+        # κ = 1/(2C_{-1} - 1) (уравнение 50)
+        self.kappa = 1.0 / (2 * C_neg - 1)
+
+        # Верхние границы для двойственных переменных (уравнение 51)
+        self.alpha_upper_pos = C_slack * C_pos      # C·C₁ для y_i = +1
+        self.alpha_upper_neg = C_slack / self.kappa  # C/κ для y_i = -1
+
+        self.w = None
+        self.b = None
+        self.support_vectors = None
+        self.support_vector_labels = None
+        self.alphas = None
+
+    def fit(self, X, y):
+        """
+        Обучение CS-SVM через решение двойственной задачи квадратичного программирования.
+
+        Args:
+            X: numpy array (n_samples, n_features) - обучающие данные
+            y: numpy array (n_samples,) - метки классов {-1, +1}
+        """
+        n_samples, n_features = X.shape
+
+        # Конвертируем метки в {-1, +1}
+        y = np.where(y > 0, 1, -1).astype(np.float64)
+
+        # Вычисление матрицы ядра K (линейное ядро: K = X @ X.T)
+        K = np.dot(X, X.T)
+
+        # Матрица P для QP: P = Y K Y, где Y = diag(y)
+        # P_ij = y_i * y_j * K_ij
+        YY = np.outer(y, y)
+        P = YY * K
+
+        # Добавляем небольшую регуляризацию для численной стабильности
+        P = P + 1e-8 * np.eye(n_samples)
+
+        # Вектор q для QP (минимизируем 1/2 α^T P α - q^T α)
+        # Из статьи (ур. 51): линейный член = α_i[(y_i+1)/2 - κ(y_i-1)/2]
+        # Для y_i = +1: (1+1)/2 - κ(1-1)/2 = 1
+        # Для y_i = -1: (-1+1)/2 - κ(-1-1)/2 = 0 + κ = κ
+        q = np.where(y > 0, 1.0, self.kappa)
+
+        # Конвертация в формат cvxopt
+        P_cvx = matrix(P.astype(np.float64))
+        q_cvx = matrix(-q.astype(np.float64))  # Минус, т.к. cvxopt минимизирует
+
+        # Ограничение равенства: Σ α_i y_i = 0
+        A_eq = matrix(y.reshape(1, -1).astype(np.float64))
+        b_eq = matrix(np.zeros(1).astype(np.float64))
+
+        # Ограничения неравенства для box constraints: 0 ≤ α_i ≤ upper_i
+        # Представляем как: -α_i ≤ 0 и α_i ≤ upper_i
+        # G α ≤ h
+        G_lower = -np.eye(n_samples)
+        h_lower = np.zeros(n_samples)
+
+        G_upper = np.eye(n_samples)
+        # Верхние границы зависят от класса (уравнение 51)
+        h_upper = np.where(y > 0, self.alpha_upper_pos, self.alpha_upper_neg)
+
+        G = np.vstack([G_lower, G_upper])
+        h = np.hstack([h_lower, h_upper])
+
+        G_cvx = matrix(G.astype(np.float64))
+        h_cvx = matrix(h.astype(np.float64))
+
+        # Решение QP задачи
+        solution = solvers.qp(P_cvx, q_cvx, G_cvx, h_cvx, A_eq, b_eq)
+
+        if solution['status'] != 'optimal':
+            print(f"Warning: QP solver status = {solution['status']}")
+
+        # Извлечение множителей Лагранжа
+        alphas = np.array(solution['x']).flatten()
+
+        # Находим опорные векторы (α_i > threshold)
+        sv_threshold = 1e-6
+        sv_indices = alphas > sv_threshold
+
+        self.alphas = alphas[sv_indices]
+        self.support_vectors = X[sv_indices]
+        self.support_vector_labels = y[sv_indices]
+
+        # Вычисление w = Σ α_i y_i x_i
+        self.w = np.sum(
+            (alphas * y).reshape(-1, 1) * X,
+            axis=0
+        )
+
+        # Вычисление b из условий KKT
+        # Для опорных векторов на границе используем:
+        # Для y_i = +1: b = 1 - w^T x_i (если 0 < α_i < C·C₁)
+        # Для y_i = -1: b = -κ - w^T x_i (если 0 < α_i < C/κ)
+        b_values = []
+        for i in range(n_samples):
+            if sv_threshold < alphas[i]:
+                upper_bound = self.alpha_upper_pos if y[i] > 0 else self.alpha_upper_neg
+                if alphas[i] < upper_bound - sv_threshold:
+                    # Свободный опорный вектор (не на границе)
+                    wx = np.dot(self.w, X[i])
+                    if y[i] > 0:
+                        b_values.append(1.0 - wx)
+                    else:
+                        b_values.append(-self.kappa - wx)
+
+        if len(b_values) > 0:
+            self.b = np.mean(b_values)
+        else:
+            # Если нет свободных SV, используем все опорные векторы
+            b_all = []
+            for i in np.where(sv_indices)[0]:
+                wx = np.dot(self.w, X[i])
+                if y[i] > 0:
+                    b_all.append(1.0 - wx)
+                else:
+                    b_all.append(-self.kappa - wx)
+            self.b = np.mean(b_all) if b_all else 0.0
+
+        return self
+
+    def decision_function(self, X):
+        """Вычисление значения решающей функции f(x) = w^T x + b"""
+        return np.dot(X, self.w) + self.b
+
+    def predict(self, X):
+        """Предсказание класса: sign(f(x))"""
+        return np.sign(self.decision_function(X))
+
+
+class MultilabelCSSVM_QP:
+    """
+    Multilabel CS-SVM с One-vs-Rest стратегией.
+
+    Для каждого класса обучается отдельный бинарный CS-SVM через QP.
+    Стоимости ошибок вычисляются адаптивно на основе дисбаланса классов.
+    """
+
+    def __init__(self, num_classes, class_counts, total_samples,
+                 C_slack=1.0, C_pos_base=3.0, C_neg_base=2.0):
+        """
+        Args:
+            num_classes: Количество классов
+            class_counts: numpy array - количество примеров каждого класса
+            total_samples: Общее количество примеров
+            C_slack: Базовый параметр регуляризации
+            C_pos_base: Базовая стоимость FN
+            C_neg_base: Базовая стоимость FP
+        """
+        self.num_classes = num_classes
+        self.C_slack = C_slack
+        self.C_neg_base = C_neg_base
+
+        # Адаптивное вычисление C_pos для каждого класса на основе дисбаланса
+        # (как в оригинальной реализации, но с учётом ограничений статьи)
         neg_counts = total_samples - class_counts
         imbalance_ratios = neg_counts / (class_counts + 1e-6)
-        c_pos_calculated = imbalance_ratios * self.C_neg
-        min_c_pos = 2 * self.C_neg - 1
-        self.C_pos_per_class = torch.clamp(c_pos_calculated, min=min_c_pos, max=50.0).float().to(CONFIG['device'])
-        self.weight_pos_term = self.C_reg * self.C_pos_per_class
-        self.weight_neg_term = self.C_reg * (1.0 / self.kappa)
+        c_pos_calculated = imbalance_ratios * C_neg_base
+        min_c_pos = 2 * C_neg_base - 1  # Ограничение из статьи
+        self.C_pos_per_class = np.clip(c_pos_calculated, min_c_pos, 50.0)
 
-    def forward(self, x):
-        return x @ self.w + self.b
+        self.classifiers = []
+        self.w = None
+        self.b = None
 
-    def compute_loss(self, x, y_target):
-        f_x = self.forward(x)
-        reg_loss = 0.5 * torch.sum(self.w ** 2)
-        is_pos = (y_target == 1).float()
-        is_neg = (y_target == 0).float()
-        raw_pos_loss = torch.clamp(1 - f_x, min=0)      
-        raw_neg_loss = torch.clamp(f_x + self.kappa, min=0) 
-        sum_pos_errors = torch.sum(is_pos * raw_pos_loss, dim=0)
-        sum_neg_errors = torch.sum(is_neg * raw_neg_loss, dim=0)
-        term_pos = torch.sum(self.weight_pos_term * sum_pos_errors)
-        term_neg = self.weight_neg_term * torch.sum(sum_neg_errors)
-        return reg_loss + term_pos + term_neg
+    def fit(self, X, Y):
+        """
+        Обучение One-vs-Rest классификаторов.
+
+        Args:
+            X: numpy array (n_samples, n_features)
+            Y: numpy array (n_samples, num_classes) - бинарные метки
+        """
+        n_samples, n_features = X.shape
+        self.w = np.zeros((n_features, self.num_classes))
+        self.b = np.zeros(self.num_classes)
+        self.classifiers = []
+
+        for c in tqdm(range(self.num_classes), desc="Training CS-SVM QP"):
+            # Преобразуем метки: 1 -> +1, 0 -> -1
+            y_binary = np.where(Y[:, c] > 0, 1, -1)
+
+            # Создаём классификатор с адаптивной стоимостью для этого класса
+            clf = BinaryCSSVM_QP(
+                C_slack=self.C_slack,
+                C_pos=self.C_pos_per_class[c],
+                C_neg=self.C_neg_base
+            )
+
+            clf.fit(X, y_binary)
+            self.classifiers.append(clf)
+
+            self.w[:, c] = clf.w
+            self.b[c] = clf.b
+
+        return self
+
+    def decision_function(self, X):
+        """Вычисление решающей функции для всех классов"""
+        return np.dot(X, self.w) + self.b
+
+    def predict(self, X):
+        """Бинарное предсказание (threshold = 0)"""
+        scores = self.decision_function(X)
+        return (scores > 0).astype(np.float32)
+
+    def predict_proba(self, X):
+        """Возвращает scores (не вероятности, но можно использовать для ранжирования)"""
+        return self.decision_function(X)
 
 def load_encoder(model_path):
     print(f"Loading encoder: {model_path}...")
@@ -172,7 +389,13 @@ def get_embeddings(model_key, model_path, dataset, mlb):
     torch.cuda.empty_cache()
     return X_train, y_train, X_test, y_test
 
-def train_sklearn_baselines(X_train, y_train, X_test, y_test, target_names_str, encoder_name):
+def train_sklearn_baselines(X_train, y_train, X_test, y_test, target_names_str, encoder_name, scaler=None):
+    """
+    Обучает sklearn baseline классификаторы.
+
+    Args:
+        scaler: Предобученный StandardScaler. Если None и use_scaler=True, создаётся новый.
+    """
     print(f"\n--- Training sklearn baselines for {encoder_name} ---")
     X_train_np = X_train.numpy() if isinstance(X_train, torch.Tensor) else X_train
     X_test_np = X_test.numpy() if isinstance(X_test, torch.Tensor) else X_test
@@ -180,9 +403,14 @@ def train_sklearn_baselines(X_train, y_train, X_test, y_test, target_names_str, 
     y_test_np = y_test.numpy() if isinstance(y_test, torch.Tensor) else y_test
 
     if CONFIG["use_scaler"]:
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train_np)
-        X_test_scaled = scaler.transform(X_test_np)
+        if scaler is not None:
+            # Используем переданный scaler для обеспечения идентичных условий
+            X_train_scaled = scaler.transform(X_train_np)
+            X_test_scaled = scaler.transform(X_test_np)
+        else:
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train_np)
+            X_test_scaled = scaler.transform(X_test_np)
     else:
         X_train_scaled = X_train_np
         X_test_scaled = X_test_np
@@ -244,8 +472,23 @@ def train_sklearn_baselines(X_train, y_train, X_test, y_test, target_names_str, 
 
 
 def main():
+    """
+    Главная функция бенчмарка.
+
+    CS-SVM реализован строго по статье "Cost-sensitive Support Vector Machines"
+    (Masnadi-Shirazi et al., arXiv:1212.0975v2) с использованием квадратичной
+    оптимизации через множители Лагранжа (dual QP formulation).
+    """
     print(f"Start Benchmark. Device: {CONFIG['device']}")
-    print(f"Using custom AdamW: {CONFIG['use_custom_adamw']}")
+    print("=" * 60)
+    print("CS-SVM: Dual QP Optimization (Lagrange multipliers)")
+    print(f"  C_slack = {CONFIG['C_slack']}")
+    print(f"  C_pos (base) = {CONFIG['C_pos']}")
+    print(f"  C_neg = {CONFIG['C_neg']}")
+    kappa = 1.0 / (2 * CONFIG['C_neg'] - 1)
+    print(f"  κ = 1/(2·C_neg - 1) = {kappa:.4f}")
+    print("=" * 60)
+
     ds = load_dataset(CONFIG['dataset_name'], "simplified")
     all_labels = set()
     for split in ds.keys():
@@ -263,99 +506,117 @@ def main():
     mlb.fit([label_list])
     mlflow.set_experiment(CONFIG["experiment_name"])
     all_results = {}
+
     for model_friendly_name, model_path in MODELS.items():
         print(f"\n{'='*40}")
         print(f"Processing: {model_friendly_name}")
         print(f"{'='*40}")
         X_train, y_train, X_test, y_test = get_embeddings(model_friendly_name, model_path, ds, mlb)
-        input_dim = X_train.shape[1]
-        with mlflow.start_run(run_name=f"CS_SVM_on_{model_friendly_name}"):
+
+        # Конвертируем в numpy
+        X_train_np = X_train.numpy() if isinstance(X_train, torch.Tensor) else X_train
+        X_test_np = X_test.numpy() if isinstance(X_test, torch.Tensor) else X_test
+        y_train_np = y_train.numpy() if isinstance(y_train, torch.Tensor) else y_train
+        y_test_np = y_test.numpy() if isinstance(y_test, torch.Tensor) else y_test
+
+        # Применяем StandardScaler
+        scaler = None
+        if CONFIG["use_scaler"]:
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train_np)
+            X_test_scaled = scaler.transform(X_test_np)
+        else:
+            X_train_scaled = X_train_np
+            X_test_scaled = X_test_np
+
+        with mlflow.start_run(run_name=f"CS_SVM_QP_on_{model_friendly_name}"):
+            # Логируем параметры CS-SVM по статье
             mlflow.log_param("encoder_model", model_path)
-            mlflow.log_param("svm_c_reg", CONFIG["C_reg"])
-            mlflow.log_param("optimizer", "custom_AdamW" if CONFIG["use_custom_adamw"] else "torch_AdamW")
-            mlflow.log_param("lr", CONFIG["svm_lr"])
-            mlflow.log_param("weight_decay", CONFIG["adamw_weight_decay"])
-            class_counts = y_train.sum(dim=0).to(CONFIG['device'])
-            svm = MultilabelCSSVM(
-                input_dim=input_dim,
+            mlflow.log_param("optimization_method", "Dual_QP_Lagrange_Multipliers")
+            mlflow.log_param("C_slack", CONFIG["C_slack"])
+            mlflow.log_param("C_pos_base", CONFIG["C_pos"])
+            mlflow.log_param("C_neg", CONFIG["C_neg"])
+            mlflow.log_param("kappa", kappa)
+            mlflow.log_param("use_scaler", CONFIG["use_scaler"])
+
+            # Подсчёт примеров каждого класса для адаптивных весов
+            class_counts = y_train_np.sum(axis=0)
+            total_samples = len(y_train_np)
+
+            print("Training CS-SVM via Dual QP (Lagrange multipliers)...")
+            print(f"  Dataset size: {total_samples} samples, {len(label_list)} classes")
+
+            # Создаём и обучаем CS-SVM через QP
+            svm = MultilabelCSSVM_QP(
                 num_classes=len(label_list),
                 class_counts=class_counts,
-                total_samples=len(y_train),
-                C_reg=CONFIG['C_reg'],
-                C_neg_base=CONFIG['C_neg_base']
-            ).to(CONFIG['device'])
-            if CONFIG["use_custom_adamw"]:
-                optimizer = CustomAdamW(
-                    svm.parameters(),
-                    lr=CONFIG['svm_lr'],
-                    weight_decay=CONFIG["adamw_weight_decay"],
-                    betas=CONFIG["adamw_betas"]
-                )
-            else:
-                optimizer = torch.optim.AdamW(
-                    svm.parameters(),
-                    lr=CONFIG['svm_lr'],
-                    weight_decay=CONFIG["adamw_weight_decay"],
-                    betas=CONFIG["adamw_betas"]
-                )
-            train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=CONFIG['batch_size_svm'], shuffle=True)
-            print("Training CS-SVM...")
-            svm.train()
-            for epoch in range(CONFIG["svm_epochs"]):
-                total_loss = 0
-                for bx, by in train_loader:
-                    bx, by = bx.to(CONFIG['device']), by.to(CONFIG['device'])
-                    optimizer.zero_grad()
-                    loss = svm.compute_loss(bx, by)
-                    loss.backward()
-                    optimizer.step()
-                    total_loss += loss.item()
-                avg_loss = total_loss / len(train_loader)
-                mlflow.log_metric("train_loss", avg_loss, step=epoch)
-                if (epoch+1) % 5 == 0:
-                    print(f"Epoch {epoch+1}: Loss {avg_loss:.4f}")
+                total_samples=total_samples,
+                C_slack=CONFIG['C_slack'],
+                C_pos_base=CONFIG['C_pos'],
+                C_neg_base=CONFIG['C_neg']
+            )
+
+            svm.fit(X_train_scaled, y_train_np)
+
             print("Evaluating CS-SVM...")
-            svm.eval()
-            with torch.no_grad():
-                test_logits = svm(X_test.to(CONFIG['device'])).cpu()
-                pred_bin = (test_logits > 0).float().numpy()
-                y_scores = test_logits.numpy()
-                y_true = y_test.numpy()
+            # Предсказания
+            y_scores = svm.decision_function(X_test_scaled)
+            pred_bin = svm.predict(X_test_scaled)
+
+            # Метрики
             metrics = {
-                "f1_micro": f1_score(y_true, pred_bin, average='micro'),
-                "f1_macro": f1_score(y_true, pred_bin, average='macro'),
-                "accuracy": accuracy_score(y_true, pred_bin)
+                "f1_micro": f1_score(y_test_np, pred_bin, average='micro'),
+                "f1_macro": f1_score(y_test_np, pred_bin, average='macro'),
+                "f1_weighted": f1_score(y_test_np, pred_bin, average='weighted'),
+                "accuracy": accuracy_score(y_test_np, pred_bin)
             }
-            metrics_at_k = compute_all_metrics_at_k(y_true, y_scores, k_values=CONFIG["k_values"])
+            metrics_at_k = compute_all_metrics_at_k(y_test_np, y_scores, k_values=CONFIG["k_values"])
             metrics.update(metrics_at_k)
-            print(f"CS-SVM Results for {model_friendly_name}:")
+
+            print(f"CS-SVM QP Results for {model_friendly_name}:")
             print(f"  F1_micro={metrics['f1_micro']:.4f}, F1_macro={metrics['f1_macro']:.4f}")
             print(f"  Precision@5={metrics.get('precision_at_5', 0):.4f}, MAP@5={metrics.get('map_at_5', 0):.4f}")
             print(f"  NDCG@5={metrics.get('ndcg_at_5', 0):.4f}, Hit_Rate@5={metrics.get('hit_rate_at_5', 0):.4f}")
+
             mlflow.log_metrics(metrics)
-            torch.save(svm.state_dict(), "svm_model.pt")
-            mlflow.log_artifact("svm_model.pt")
-            report = classification_report(y_true, pred_bin, target_names=target_names_str, zero_division=0)
-            with open("classification_report.txt", "w") as f:
-                f.write(f"Encoder: {model_friendly_name}\nOptimizer: {'custom' if CONFIG['use_custom_adamw'] else 'torch'} AdamW\n\n")
+
+            # Сохраняем веса модели
+            np.savez("svm_model_qp.npz", w=svm.w, b=svm.b)
+            mlflow.log_artifact("svm_model_qp.npz")
+
+            # Сохраняем отчёт классификации
+            report = classification_report(y_test_np, pred_bin, target_names=target_names_str, zero_division=0)
+            with open("classification_report.txt", "w", encoding="utf-8") as f:
+                f.write(f"Encoder: {model_friendly_name}\n")
+                f.write("Optimization: Dual QP (Lagrange multipliers)\n")
+                f.write(f"Paper: Cost-sensitive Support Vector Machines (arXiv:1212.0975v2)\n\n")
+                f.write(f"Parameters:\n")
+                f.write(f"  C_slack = {CONFIG['C_slack']}\n")
+                f.write(f"  C_neg = {CONFIG['C_neg']}\n")
+                f.write(f"  κ = {kappa:.4f}\n\n")
                 f.write(report)
             mlflow.log_artifact("classification_report.txt")
-            all_results[f"CS_SVM_{model_friendly_name}"] = metrics
-            print(f"CS-SVM run for {model_friendly_name} completed.")
+
+            all_results[f"CS_SVM_QP_{model_friendly_name}"] = metrics
+            print(f"CS-SVM QP run for {model_friendly_name} completed.")
+
         if CONFIG["run_sklearn_baseline"]:
+            # Передаём тот же scaler для обеспечения идентичных условий
             sklearn_results = train_sklearn_baselines(
                 X_train, y_train, X_test, y_test,
-                target_names_str, model_friendly_name
+                target_names_str, model_friendly_name,
+                scaler=scaler if CONFIG["use_scaler"] else None
             )
-            for clf_name, metrics in sklearn_results.items():
-                all_results[f"{clf_name}_{model_friendly_name}"] = metrics
+            for clf_name, m in sklearn_results.items():
+                all_results[f"{clf_name}_{model_friendly_name}"] = m
+
     print("\n" + "="*80)
     print("SUMMARY - All Results")
     print("="*80)
-    print(f"{'Model':<40} {'F1_micro':<10} {'F1_macro':<10} {'MAP@5':<10} {'NDCG@5':<10}")
-    print("-"*80)
+    print(f"{'Model':<45} {'F1_micro':<10} {'F1_macro':<10} {'MAP@5':<10} {'NDCG@5':<10}")
+    print("-"*85)
     for name, m in all_results.items():
-        print(f"{name:<40} {m['f1_micro']:<10.4f} {m['f1_macro']:<10.4f} {m.get('map_at_5', 0):<10.4f} {m.get('ndcg_at_5', 0):<10.4f}")
+        print(f"{name:<45} {m['f1_micro']:<10.4f} {m['f1_macro']:<10.4f} {m.get('map_at_5', 0):<10.4f} {m.get('ndcg_at_5', 0):<10.4f}")
 
 if __name__ == "__main__":
     main()
