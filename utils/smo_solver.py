@@ -24,7 +24,6 @@ Sequential Minimal Optimization (SMO) солвер для Cost-Sensitive SVM.
 Оптимизации:
 - Memory-efficient: вычисление элементов ядра "на лету" вместо хранения полной матрицы O(N²)
 - Numba JIT: ускорение критических циклов SMO в 10-100 раз
-- LRU-кэширование строк ядра для частого доступа
 
 Автор: Курсовая работа
 """
@@ -38,7 +37,6 @@ try:
     NUMBA_AVAILABLE = True
 except ImportError:
     NUMBA_AVAILABLE = False
-    # Fallback декораторы если Numba не установлена
     def njit(*args, **kwargs):
         def decorator(func):
             return func
@@ -52,135 +50,139 @@ except ImportError:
 @dataclass
 class SMOResult:
     """Результат работы SMO солвера."""
-    alpha: np.ndarray          # Множители Лагранжа
-    b: float                   # Смещение (bias)
-    n_iterations: int          # Количество итераций
-    n_support_vectors: int     # Количество опорных векторов
-    converged: bool            # Сходимость достигнута
-    objective_value: float     # Значение целевой функции
+    alpha: np.ndarray
+    b: float
+    n_iterations: int
+    n_support_vectors: int
+    converged: bool
+    objective_value: float
 
 
 # =============================================================================
-# Numba-оптимизированные функции ядра
+# Numba-оптимизированные функции
 # =============================================================================
 
 @njit(fastmath=True, cache=True)
-def linear_kernel_single(x_i: np.ndarray, x_j: np.ndarray) -> float:
-    """Линейное ядро для двух векторов: K(x_i, x_j) = x_i^T x_j"""
-    return np.dot(x_i, x_j)
+def compute_f(X: np.ndarray, y: np.ndarray, alpha: np.ndarray, b: float, idx: int) -> float:
+    """Вычисляет f(x_idx) = Σ α_j y_j K(x_j, x_idx) + b"""
+    result = b
+    n = len(alpha)
+    for j in range(n):
+        if alpha[j] > 1e-10:
+            K_j_idx = np.dot(X[j], X[idx])
+            result += alpha[j] * y[j] * K_j_idx
+    return result
 
 
 @njit(fastmath=True, cache=True)
-def linear_kernel_row(X: np.ndarray, idx: int) -> np.ndarray:
-    """
-    Вычисляет строку матрицы ядра: K[idx, :] = X @ X[idx].T
+def compute_all_f(X: np.ndarray, y: np.ndarray, alpha: np.ndarray, b: float) -> np.ndarray:
+    """Вычисляет f(x_i) для всех примеров."""
+    n = len(alpha)
+    f_vals = np.full(n, b)
 
-    Memory-efficient: вычисляется на лету, не требует хранения полной матрицы.
-
-    Args:
-        X: Матрица данных (n_samples, n_features)
-        idx: Индекс строки
-
-    Returns:
-        K_row: Строка матрицы ядра (n_samples,)
-    """
-    n_samples = X.shape[0]
-    K_row = np.empty(n_samples, dtype=np.float64)
-    x_idx = X[idx]
-    for i in range(n_samples):
-        K_row[i] = np.dot(X[i], x_idx)
-    return K_row
+    for j in range(n):
+        if alpha[j] > 1e-10:
+            for i in range(n):
+                K_ji = np.dot(X[j], X[i])
+                f_vals[i] += alpha[j] * y[j] * K_ji
+    return f_vals
 
 
 @njit(fastmath=True, cache=True)
-def compute_Q_row(X: np.ndarray, y: np.ndarray, idx: int) -> np.ndarray:
-    """
-    Вычисляет строку матрицы Q: Q[idx, :] = y[idx] * y * K[idx, :]
-
-    Args:
-        X: Матрица данных (n_samples, n_features)
-        y: Метки классов (n_samples,)
-        idx: Индекс строки
-
-    Returns:
-        Q_row: Строка матрицы Q (n_samples,)
-    """
-    K_row = linear_kernel_row(X, idx)
-    return y[idx] * y * K_row
+def update_f_values(
+    f_vals: np.ndarray,
+    X: np.ndarray,
+    y: np.ndarray,
+    i: int, j: int,
+    delta_alpha_i: float,
+    delta_alpha_j: float
+) -> None:
+    """Инкрементально обновляет f после изменения α_i, α_j."""
+    n = len(f_vals)
+    for k in range(n):
+        K_ik = np.dot(X[i], X[k])
+        K_jk = np.dot(X[j], X[k])
+        f_vals[k] += delta_alpha_i * y[i] * K_ik + delta_alpha_j * y[j] * K_jk
 
 
 @njit(fastmath=True, cache=True)
-def compute_Q_element(X: np.ndarray, y: np.ndarray, i: int, j: int) -> float:
-    """Вычисляет один элемент матрицы Q: Q[i,j] = y[i] * y[j] * K(x_i, x_j)"""
-    k_ij = np.dot(X[i], X[j])
-    return y[i] * y[j] * k_ij
-
-
-# =============================================================================
-# SMO алгоритм с Numba-оптимизацией
-# =============================================================================
-
-@njit(fastmath=True, cache=True)
-def select_working_set_wss3(
+def select_working_set(
     alpha: np.ndarray,
-    gradient: np.ndarray,
+    f_vals: np.ndarray,
     y: np.ndarray,
     C: np.ndarray,
+    margins: np.ndarray,
     eps: float,
     tol: float
 ) -> Tuple[int, int, bool]:
     """
-    Выбор рабочего множества методом WSS3 (Working Set Selection 3).
+    Выбор рабочей пары (i, j) по методу максимального нарушения KKT.
 
-    Оптимизированная Numba-версия для быстрого выбора пары (i, j).
+    Для задачи МАКСИМИЗАЦИИ dual:
+    - E_i = f(x_i) - y_i * margin_i (ошибка)
+    - Если α_i = 0 и y_i*E_i < -tol: может увеличиться (нарушение)
+    - Если α_i = C_i и y_i*E_i > tol: может уменьшиться (нарушение)
+    - Если 0 < α_i < C_i и |y_i*E_i| > tol: нарушение
 
-    Returns:
-        (i, j, found): Индексы выбранной пары и флаг успеха
+    Выбираем i с максимальным нарушением, j - максимизирующий |E_i - E_j|.
     """
     n = len(alpha)
 
-    # Вычисляем -y * gradient для всех примеров
-    neg_y_grad = -y * gradient
+    # Вычисляем ошибки E_i = f(x_i) - y_i * margin_i
+    E = np.empty(n)
+    for k in range(n):
+        E[k] = f_vals[k] - y[k] * margins[k]
 
-    # Ищем максимум среди I_up (примеры, которые могут увеличиться)
+    # Множество I_up: примеры где α может увеличиться
+    # y_i = +1: α_i < C_i (может расти)
+    # y_i = -1: α_i > 0 (может уменьшаться, что для -1 означает рост влияния)
+
+    # Множество I_down: примеры где α может уменьшиться
+    # y_i = +1: α_i > 0 (может уменьшаться)
+    # y_i = -1: α_i < C_i (может расти)
+
+    # Ищем максимальный -y*E среди I_up
     max_i = -1
-    max_val = -np.inf
+    max_neg_yE = -np.inf
 
-    for i in range(n):
-        # I_up: α_i < C_i для y_i > 0, или α_i > 0 для y_i < 0
+    for k in range(n):
         in_I_up = False
-        if y[i] > 0:
-            in_I_up = alpha[i] < C[i] - eps
+        if y[k] > 0:
+            in_I_up = alpha[k] < C[k] - eps
         else:
-            in_I_up = alpha[i] > eps
+            in_I_up = alpha[k] > eps
 
-        if in_I_up and neg_y_grad[i] > max_val:
-            max_val = neg_y_grad[i]
-            max_i = i
+        neg_yE = -y[k] * E[k]
+        if in_I_up and neg_yE > max_neg_yE:
+            max_neg_yE = neg_yE
+            max_i = k
 
     if max_i < 0:
         return -1, -1, False
 
     i = max_i
 
-    # Ищем минимум среди I_down с условием neg_y_grad[j] < neg_y_grad[i] - tol
+    # Ищем минимальный -y*E среди I_down
     min_j = -1
-    min_val = np.inf
-    threshold = neg_y_grad[i] - tol
+    min_neg_yE = np.inf
 
-    for j in range(n):
-        # I_down: α_j > 0 для y_j > 0, или α_j < C_j для y_j < 0
+    for k in range(n):
         in_I_down = False
-        if y[j] > 0:
-            in_I_down = alpha[j] > eps
+        if y[k] > 0:
+            in_I_down = alpha[k] > eps
         else:
-            in_I_down = alpha[j] < C[j] - eps
+            in_I_down = alpha[k] < C[k] - eps
 
-        if in_I_down and neg_y_grad[j] < threshold and neg_y_grad[j] < min_val:
-            min_val = neg_y_grad[j]
-            min_j = j
+        neg_yE = -y[k] * E[k]
+        if in_I_down and neg_yE < min_neg_yE:
+            min_neg_yE = neg_yE
+            min_j = k
 
     if min_j < 0:
+        return -1, -1, False
+
+    # Проверяем нарушение оптимальности
+    if max_neg_yE - min_neg_yE < tol:
         return -1, -1, False
 
     return i, min_j, True
@@ -188,75 +190,77 @@ def select_working_set_wss3(
 
 @njit(fastmath=True, cache=True)
 def compute_bounds(
-    alpha_i: float,
-    alpha_j: float,
-    y_i: float,
-    y_j: float,
-    C_i: float,
-    C_j: float
+    alpha_i: float, alpha_j: float,
+    y_i: float, y_j: float,
+    C_i: float, C_j: float
 ) -> Tuple[float, float]:
-    """
-    Вычисляет границы L и H для α_j при оптимизации пары (i, j).
-    """
+    """Границы L и H для α_j при оптимизации пары."""
     if y_i != y_j:
-        # y_i ≠ y_j: α_i - α_j = const
         L = max(0.0, alpha_j - alpha_i)
         H = min(C_j, C_i + alpha_j - alpha_i)
     else:
-        # y_i = y_j: α_i + α_j = const
         L = max(0.0, alpha_i + alpha_j - C_i)
         H = min(C_j, alpha_i + alpha_j)
     return L, H
 
 
 @njit(fastmath=True, cache=True)
-def optimize_pair_numba(
-    i: int,
-    j: int,
+def optimize_pair(
+    i: int, j: int,
     alpha: np.ndarray,
-    gradient: np.ndarray,
+    f_vals: np.ndarray,
     X: np.ndarray,
     y: np.ndarray,
     C: np.ndarray,
+    margins: np.ndarray,
     eps: float
-) -> Tuple[float, float, bool, float, float]:
+) -> Tuple[float, float, bool]:
     """
-    Оптимизация пары переменных (α_i, α_j) с вычислением ядра на лету.
+    Оптимизация пары (α_i, α_j).
 
-    Returns:
-        (new_alpha_i, new_alpha_j, changed, K_ii_plus_K_jj, K_ij)
+    Формула SMO для задачи максимизации:
+    α_j_new = α_j_old + y_j * (E_i - E_j) / η
+    где η = K_ii + K_jj - 2*K_ij
     """
     alpha_i_old = alpha[i]
     alpha_j_old = alpha[j]
     y_i, y_j = y[i], y[j]
     C_i, C_j = C[i], C[j]
 
-    # Вычисляем границы
     L, H = compute_bounds(alpha_i_old, alpha_j_old, y_i, y_j, C_i, C_j)
 
     if L >= H - eps:
-        return alpha_i_old, alpha_j_old, False, 0.0, 0.0
+        return alpha_i_old, alpha_j_old, False
 
-    # Вычисляем элементы ядра на лету
+    # Ошибки
+    E_i = f_vals[i] - y_i * margins[i]
+    E_j = f_vals[j] - y_j * margins[j]
+
+    # Элементы ядра
     K_ii = np.dot(X[i], X[i])
     K_jj = np.dot(X[j], X[j])
     K_ij = np.dot(X[i], X[j])
 
-    # η = K_ii + K_jj - 2·K_ij
     eta = K_ii + K_jj - 2.0 * K_ij
 
-    # E_i = -y_i * gradient[i], E_j = -y_j * gradient[j]
-    E_i = -y_i * gradient[i]
-    E_j = -y_j * gradient[j]
-
     if eta > eps:
-        # Стандартный случай: η > 0
         alpha_j_new = alpha_j_old + y_j * (E_i - E_j) / eta
     else:
-        # η <= 0: выбираем границу (упрощённо)
-        alpha_j_new = alpha_j_old
+        # η <= 0: выбираем границу по значению целевой функции
+        # Упрощённо: оставляем как есть или берём ближайшую границу
+        s = y_i * y_j
+        f1 = y_j * (E_i - E_j)
+        # При η=0, df/dα_j = y_j*(E_i - E_j) = f1
+        # Если f1 > 0: α_j растёт -> H
+        # Если f1 < 0: α_j падает -> L
+        if f1 > 0:
+            alpha_j_new = H
+        elif f1 < 0:
+            alpha_j_new = L
+        else:
+            alpha_j_new = alpha_j_old
 
-    # Ограничиваем в [L, H]
+    # Clip to bounds
     if alpha_j_new > H:
         alpha_j_new = H
     elif alpha_j_new < L:
@@ -264,138 +268,75 @@ def optimize_pair_numba(
 
     # Проверяем значимость изменения
     if abs(alpha_j_new - alpha_j_old) < eps * (alpha_j_old + alpha_j_new + eps):
-        return alpha_i_old, alpha_j_old, False, K_ii + K_jj, K_ij
+        return alpha_i_old, alpha_j_old, False
 
-    # Вычисляем новое α_i
+    # Вычисляем новое α_i из ограничения α_i*y_i + α_j*y_j = const
     alpha_i_new = alpha_i_old + y_i * y_j * (alpha_j_old - alpha_j_new)
 
-    # Ограничиваем α_i
+    # Clip α_i
     if alpha_i_new > C_i:
         alpha_i_new = C_i
     elif alpha_i_new < 0:
         alpha_i_new = 0.0
 
-    return alpha_i_new, alpha_j_new, True, K_ii + K_jj, K_ij
+    return alpha_i_new, alpha_j_new, True
 
 
 @njit(fastmath=True, cache=True)
-def update_gradient_optimized(
-    gradient: np.ndarray,
-    X: np.ndarray,
-    y: np.ndarray,
-    i: int,
-    j: int,
-    delta_alpha_i: float,
-    delta_alpha_j: float
-) -> None:
-    """
-    Обновляет градиент после изменения α_i и α_j.
-
-    gradient_new = gradient_old - Q[:, i]·Δα_i - Q[:, j]·Δα_j
-
-    Вычисление Q на лету: Q[:, k] = y * y[k] * K[:, k]
-    """
-    n = len(gradient)
-    y_i, y_j = y[i], y[j]
-    x_i, x_j = X[i], X[j]
-
-    for k in range(n):
-        # K[k, i] = X[k] · X[i]
-        K_ki = np.dot(X[k], x_i)
-        K_kj = np.dot(X[k], x_j)
-
-        # Q[k, i] = y[k] * y[i] * K[k, i]
-        Q_ki = y[k] * y_i * K_ki
-        Q_kj = y[k] * y_j * K_kj
-
-        gradient[k] -= delta_alpha_i * Q_ki + delta_alpha_j * Q_kj
-
-
-@njit(fastmath=True, cache=True)
-def check_kkt_violation(
+def compute_bias(
     alpha: np.ndarray,
-    gradient: np.ndarray,
+    f_vals: np.ndarray,
     y: np.ndarray,
     C: np.ndarray,
+    margins: np.ndarray,
     eps: float
 ) -> float:
-    """Вычисляет максимальное нарушение KKT условий."""
-    n = len(alpha)
-    max_violation = 0.0
-
-    for i in range(n):
-        y_i = y[i]
-        C_i = C[i]
-        yg = y_i * gradient[i]
-
-        if alpha[i] < eps:
-            # α_i = 0
-            if y_i > 0:
-                violation = max(0.0, -yg)
-            else:
-                violation = max(0.0, yg)
-        elif alpha[i] > C_i - eps:
-            # α_i = C_i
-            if y_i > 0:
-                violation = max(0.0, yg)
-            else:
-                violation = max(0.0, -yg)
-        else:
-            # 0 < α_i < C_i
-            violation = abs(yg)
-
-        if violation > max_violation:
-            max_violation = violation
-
-    return max_violation
-
-
-@njit(fastmath=True, cache=True)
-def compute_bias_from_gradient(
-    alpha: np.ndarray,
-    gradient: np.ndarray,
-    y: np.ndarray,
-    C: np.ndarray,
-    eps: float
-) -> float:
-    """Вычисляет смещение b из KKT условий."""
+    """Вычисляет bias из KKT условий на свободных опорных векторах."""
     n = len(alpha)
     b_sum = 0.0
     n_free = 0
 
     for i in range(n):
-        C_i = C[i]
-        if eps < alpha[i] < C_i - eps:
-            # Свободный опорный вектор: b = y_i * gradient[i]
-            b_sum += y[i] * gradient[i]
+        if eps < alpha[i] < C[i] - eps:
+            # Свободный SV: f(x_i) = y_i * margin_i
+            # b = y_i * margin_i - Σ α_j y_j K_ji
+            # f(x_i) = Σ α_j y_j K_ji + b
+            # Для свободного SV: f(x_i) должно равняться y_i*m_i
+            # Текущий f_vals[i] включает текущий b
+            # Но мы пересчитаем из условия:
+            # b_i = y_i * margins[i] - (f_vals[i] - текущий_b)
+            # Проще: для свободного SV ошибка E_i = 0
+            # E_i = f_vals[i] - y_i * margins[i] = 0
+            # => b корректируется так чтобы это выполнялось
+            b_sum += y[i] * margins[i] - f_vals[i]
             n_free += 1
 
     if n_free > 0:
+        # Среднее смещение которое нужно добавить к текущему b
         return b_sum / n_free
 
-    # Нет свободных SV — используем граничные
+    # Нет свободных SV
     b_low = -1e30
     b_high = 1e30
 
     for i in range(n):
         y_i = y[i]
-        C_i = C[i]
-        b_i = y_i * gradient[i]
+        E_i = f_vals[i] - y_i * margins[i]
 
         if alpha[i] < eps:
+            # α = 0: y*E <= 0 (для выполнения KKT)
             if y_i > 0:
-                if b_i < b_high:
-                    b_high = b_i
+                # y=+1: E <= 0 => f <= m => b <= m - (f-b) => b_i = m - f + b_current
+                b_high = min(b_high, -E_i)
             else:
-                if b_i > b_low:
-                    b_low = b_i
-        elif alpha[i] > C_i - eps:
+                # y=-1: E >= 0 => f >= m (но m отриц) => b >= ...
+                b_low = max(b_low, -E_i)
+        elif alpha[i] > C[i] - eps:
+            # α = C: y*E >= 0
             if y_i > 0:
-                if b_i > b_low:
-                    b_low = b_i
+                b_low = max(b_low, -E_i)
             else:
-                if b_i < b_high:
-                    b_high = b_i
+                b_high = min(b_high, -E_i)
 
     if b_low > -1e29 and b_high < 1e29:
         return (b_low + b_high) / 2
@@ -403,8 +344,7 @@ def compute_bias_from_gradient(
         return b_low
     elif b_high < 1e29:
         return b_high
-    else:
-        return 0.0
+    return 0.0
 
 
 @njit(fastmath=True, cache=True)
@@ -412,64 +352,65 @@ def smo_main_loop(
     X: np.ndarray,
     y: np.ndarray,
     alpha: np.ndarray,
-    gradient: np.ndarray,
     C: np.ndarray,
+    margins: np.ndarray,
     q: np.ndarray,
     eps: float,
     tol: float,
-    max_iter: int,
-    check_interval: int = 100
-) -> Tuple[np.ndarray, int, bool]:
+    max_iter: int
+) -> Tuple[np.ndarray, float, int, bool]:
     """
-    Основной цикл SMO с Numba-оптимизацией.
-
-    Memory-efficient: матрица Q не создаётся, элементы вычисляются на лету.
+    Основной цикл SMO.
 
     Returns:
-        (alpha, n_iterations, converged)
+        (alpha, b, n_iterations, converged)
     """
-    n_iter = 0
+    n = len(alpha)
+    b = 0.0
+
+    # Инициализируем f(x_i) = b = 0 для всех (т.к. α=0)
+    f_vals = np.zeros(n)
+
     converged = False
+    n_iter = 0
 
     for iteration in range(max_iter):
         n_iter = iteration + 1
 
-        # Выбор рабочего множества
-        i, j, found = select_working_set_wss3(alpha, gradient, y, C, eps, tol)
+        # Выбираем рабочую пару
+        i, j, found = select_working_set(alpha, f_vals, y, C, margins, eps, tol)
 
         if not found:
             converged = True
             break
 
-        # Оптимизация пары
         alpha_i_old = alpha[i]
         alpha_j_old = alpha[j]
 
-        alpha_i_new, alpha_j_new, changed, _, _ = optimize_pair_numba(
-            i, j, alpha, gradient, X, y, C, eps
+        alpha_i_new, alpha_j_new, changed = optimize_pair(
+            i, j, alpha, f_vals, X, y, C, margins, eps
         )
 
         if not changed:
             continue
 
-        # Обновляем α
         delta_alpha_i = alpha_i_new - alpha_i_old
         delta_alpha_j = alpha_j_new - alpha_j_old
 
         alpha[i] = alpha_i_new
         alpha[j] = alpha_j_new
 
-        # Обновляем градиент
-        update_gradient_optimized(gradient, X, y, i, j, delta_alpha_i, delta_alpha_j)
+        # Обновляем f_vals инкрементально
+        update_f_values(f_vals, X, y, i, j, delta_alpha_i, delta_alpha_j)
 
-        # Проверка сходимости
-        if (iteration + 1) % check_interval == 0:
-            kkt_violation = check_kkt_violation(alpha, gradient, y, C, eps)
-            if kkt_violation < tol:
-                converged = True
-                break
+        # Обновляем b
+        b_delta = compute_bias(alpha, f_vals, y, C, margins, eps)
+        # Добавляем дельту к f_vals (чтобы включить новый b)
+        for k in range(n):
+            f_vals[k] += b_delta
+        b += b_delta
 
-    return alpha, n_iter, converged
+    return alpha, b, n_iter, converged
 
 
 # =============================================================================
@@ -478,23 +419,9 @@ def smo_main_loop(
 
 class CSSVMDualQPSolver:
     """
-    Решение двойственной задачи квадратичного программирования для CS-SVM
-    методом Sequential Minimal Optimization (SMO).
+    SMO солвер для CS-SVM (Cost-Sensitive Support Vector Machine).
 
-    Memory-efficient версия: матрица Q не хранится целиком, элементы
-    вычисляются на лету. Это позволяет работать с датасетами любого размера.
-
-    Двойственная задача (уравнение 51 из статьи):
-        max_α Σ_i α_i·q_i - 1/2 α^T Q α
-
-        где Q_ij = y_i y_j K(x_i, x_j)
-            q_i = 1 для y_i = +1, q_i = κ для y_i = -1
-
-        s.t. Σ_i α_i y_i = 0  (ограничение равенства)
-             0 ≤ α_i ≤ C_i    (box constraints)
-
-        где C_i = C·C₁ для y_i = +1
-            C_i = C/κ  для y_i = -1
+    Memory-efficient: матрица Q не хранится, элементы вычисляются на лету.
     """
 
     def __init__(
@@ -507,19 +434,6 @@ class CSSVMDualQPSolver:
         max_iter: int = 10000,
         verbose: bool = False
     ):
-        """
-        Инициализация солвера.
-
-        Args:
-            C_slack: Параметр регуляризации C (soft margin)
-            C_pos: C₁ - стоимость ошибки на положительном классе
-            C_neg: C₋₁ - стоимость ошибки на отрицательном классе
-            tol: Допуск для проверки KKT условий
-            eps: Минимальное изменение α для обновления
-            max_iter: Максимальное количество итераций
-            verbose: Выводить отладочную информацию
-        """
-        # Проверка условий из статьи (уравнение 50)
         if C_neg < 1.0:
             raise ValueError(f"C_neg должно быть >= 1, получено {C_neg}")
         min_c_pos = 2 * C_neg - 1
@@ -534,85 +448,48 @@ class CSSVMDualQPSolver:
         self.max_iter = max_iter
         self.verbose = verbose
 
-        # Вычисление κ по формуле (50): κ = 1/(2C₋₁ - 1)
+        # κ = 1/(2C_{-1} - 1)
         self.kappa = 1.0 / (2 * C_neg - 1)
 
-        # Верхние границы для box constraints (уравнение 51)
-        self.C_upper_pos = C_slack * C_pos      # C·C₁ для y_i = +1
-        self.C_upper_neg = C_slack / self.kappa  # C/κ для y_i = -1
+        # Box constraints
+        self.C_upper_pos = C_slack * C_pos      # C·C₁ для y=+1
+        self.C_upper_neg = C_slack / self.kappa  # C/κ для y=-1
 
-    def _get_upper_bound(self, y_i: float) -> float:
-        """Возвращает верхнюю границу C_i для примера с меткой y_i."""
-        return self.C_upper_pos if y_i > 0 else self.C_upper_neg
-
-    def _get_linear_coef(self, y_i: float) -> float:
-        """
-        Возвращает коэффициент линейного члена q_i.
-
-        Из уравнения 51: q_i = (y_i+1)/2 - κ(y_i-1)/2
-        Для y_i = +1: q_i = 1
-        Для y_i = -1: q_i = κ
-        """
-        return 1.0 if y_i > 0 else self.kappa
-
-    def solve(
-        self,
-        X: np.ndarray,
-        y: np.ndarray
-    ) -> SMOResult:
-        """
-        Решает двойственную задачу CS-SVM методом SMO.
-
-        Memory-efficient: матрица Q не создаётся целиком.
-
-        Args:
-            X: Матрица признаков (n_samples, n_features)
-            y: Метки классов, значения {-1, +1}
-
-        Returns:
-            SMOResult с решением
-        """
+    def solve(self, X: np.ndarray, y: np.ndarray) -> SMOResult:
+        """Решает двойственную задачу CS-SVM."""
         n_samples = X.shape[0]
 
-        # Убеждаемся, что данные contiguous для Numba
         X = np.ascontiguousarray(X, dtype=np.float64)
-
-        # Нормализуем метки к {-1, +1}
         y = np.where(y > 0, 1.0, -1.0).astype(np.float64)
         y = np.ascontiguousarray(y)
 
         # Инициализация
         alpha = np.zeros(n_samples, dtype=np.float64)
 
-        # Вектор линейных коэффициентов q_i
-        q = np.array([self._get_linear_coef(y_i) for y_i in y], dtype=np.float64)
+        # q_i: линейный коэффициент (не используется напрямую в SMO)
+        q = np.array([1.0 if y_i > 0 else self.kappa for y_i in y], dtype=np.float64)
 
-        # Верхние границы C_i для каждого примера
-        C = np.array([self._get_upper_bound(y_i) for y_i in y], dtype=np.float64)
+        # C_i: верхняя граница
+        C = np.array([self.C_upper_pos if y_i > 0 else self.C_upper_neg for y_i in y], dtype=np.float64)
 
-        # Инициализация градиента: gradient = q - Q·α = q (т.к. α = 0)
-        gradient = q.copy()
+        # margins: целевые margins для каждого класса
+        # Для y=+1: margin = 1 (w·x + b >= 1)
+        # Для y=-1: margin = κ (w·x + b <= -κ, т.е. y*(w·x+b) >= κ)
+        margins = np.array([1.0 if y_i > 0 else self.kappa for y_i in y], dtype=np.float64)
 
         if self.verbose:
             print(f"SMO solver started: {n_samples} samples")
             print(f"  Memory-efficient mode: Q matrix NOT stored")
             print(f"  Numba JIT: {'enabled' if NUMBA_AVAILABLE else 'disabled'}")
 
-        # Основной цикл SMO (Numba-оптимизированный)
-        alpha, n_iter, converged = smo_main_loop(
-            X, y, alpha, gradient, C, q,
-            self.eps, self.tol, self.max_iter,
-            check_interval=100
+        # Запускаем SMO
+        alpha, b, n_iter, converged = smo_main_loop(
+            X, y, alpha, C, margins, q,
+            self.eps, self.tol, self.max_iter
         )
 
-        # Вычисляем bias
-        b = compute_bias_from_gradient(alpha, gradient, y, C, self.eps)
-
-        # Подсчёт опорных векторов
         n_sv = int(np.sum(alpha > self.eps))
-
-        # Вычисляем значение целевой функции (для отчёта)
-        obj = self._compute_objective_efficient(alpha, X, y, q)
+        obj = self._compute_objective(alpha, X, y, q)
 
         if self.verbose:
             print(f"SMO finished: {n_iter} iterations, {n_sv} support vectors, converged={converged}")
@@ -627,39 +504,21 @@ class CSSVMDualQPSolver:
             objective_value=obj
         )
 
-    def _compute_objective_efficient(
-        self,
-        alpha: np.ndarray,
-        X: np.ndarray,
-        y: np.ndarray,
-        q: np.ndarray
-    ) -> float:
-        """
-        Вычисляет значение целевой функции без хранения полной матрицы Q.
-
-        f(α) = q^T α - 1/2 α^T Q α
-             = q^T α - 1/2 Σ_i Σ_j α_i α_j y_i y_j K_ij
-        """
-        # Линейная часть
+    def _compute_objective(self, alpha: np.ndarray, X: np.ndarray, y: np.ndarray, q: np.ndarray) -> float:
+        """f(α) = q^T α - 1/2 α^T Q α"""
         linear_part = np.dot(q, alpha)
 
-        # Квадратичная часть: вычисляем только для ненулевых α
         sv_mask = alpha > self.eps
         if not np.any(sv_mask):
             return linear_part
 
-        sv_indices = np.where(sv_mask)[0]
-        alpha_sv = alpha[sv_indices]
-        y_sv = y[sv_indices]
-        X_sv = X[sv_indices]
+        sv_idx = np.where(sv_mask)[0]
+        alpha_sv = alpha[sv_idx]
+        y_sv = y[sv_idx]
+        X_sv = X[sv_idx]
 
-        # K_sv = X_sv @ X_sv.T
         K_sv = np.dot(X_sv, X_sv.T)
-
-        # Q_sv = (y_sv * y_sv.T) * K_sv
-        YY_sv = np.outer(y_sv, y_sv)
-        Q_sv = YY_sv * K_sv
-
+        Q_sv = np.outer(y_sv, y_sv) * K_sv
         quad_part = 0.5 * np.dot(alpha_sv, np.dot(Q_sv, alpha_sv))
 
         return linear_part - quad_part
@@ -676,29 +535,15 @@ def solve_cssvm_dual_qp(
     verbose: bool = False
 ) -> Tuple[np.ndarray, float, np.ndarray]:
     """
-    Решает двойственную задачу CS-SVM и возвращает вектор весов w и смещение b.
-
-    Это главная функция-обёртка для использования в BinaryCSSVM.
-
-    Args:
-        X: Матрица признаков (n_samples, n_features)
-        y: Метки классов (n_samples,), значения {0, 1} или {-1, +1}
-        C_slack: Параметр регуляризации C
-        C_pos: C₁ - стоимость FN
-        C_neg: C₋₁ - стоимость FP
-        tol: Допуск сходимости
-        max_iter: Максимум итераций
-        verbose: Выводить прогресс
+    Решает двойственную задачу CS-SVM.
 
     Returns:
-        w: Вектор весов (n_features,)
-        b: Смещение (скаляр)
-        alpha: Множители Лагранжа (n_samples,)
+        w: Вектор весов
+        b: Смещение
+        alpha: Множители Лагранжа
     """
-    # Нормализуем метки
     y_norm = np.where(y > 0, 1.0, -1.0).astype(np.float64)
 
-    # Создаём солвер
     solver = CSSVMDualQPSolver(
         C_slack=C_slack,
         C_pos=C_pos,
@@ -708,27 +553,22 @@ def solve_cssvm_dual_qp(
         verbose=verbose
     )
 
-    # Решаем
     result = solver.solve(X, y_norm)
 
-    # Вычисляем w = Σ α_i y_i x_i
+    # w = Σ α_i y_i x_i
     w = np.sum((result.alpha * y_norm).reshape(-1, 1) * X, axis=0)
 
     return w, result.b, result.alpha
 
 
 # =============================================================================
-# Быстрая версия для малых датасетов (с предвычислением Q)
+# Fast версия для малых датасетов
 # =============================================================================
 
 class CSSVMDualQPSolverFast:
     """
-    Быстрая версия солвера для малых датасетов (< 15k примеров).
-
-    Предвычисляет матрицу Q целиком для максимальной скорости.
-    Использует больше памяти: O(N²) для матрицы Q.
-
-    Для больших датасетов используйте CSSVMDualQPSolver (memory-efficient).
+    Быстрая версия с предвычислением матрицы Q.
+    Для датасетов < 15k примеров.
     """
 
     def __init__(
@@ -742,10 +582,10 @@ class CSSVMDualQPSolverFast:
         verbose: bool = False
     ):
         if C_neg < 1.0:
-            raise ValueError(f"C_neg должно быть >= 1, получено {C_neg}")
+            raise ValueError(f"C_neg >= 1 required")
         min_c_pos = 2 * C_neg - 1
         if C_pos < min_c_pos:
-            raise ValueError(f"C_pos должно быть >= {min_c_pos}, получено {C_pos}")
+            raise ValueError(f"C_pos >= {min_c_pos} required")
 
         self.C_slack = C_slack
         self.C_pos = C_pos
@@ -760,29 +600,21 @@ class CSSVMDualQPSolverFast:
         self.C_upper_neg = C_slack / self.kappa
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> SMOResult:
-        """Решает задачу с предвычислением матрицы Q."""
-        n_samples = X.shape[0]
-
-        # Проверка размера (предупреждение для больших датасетов)
-        estimated_memory_gb = (n_samples ** 2 * 8) / (1024 ** 3)
-        if estimated_memory_gb > 2:
-            print(f"Warning: Q matrix will use ~{estimated_memory_gb:.1f} GB RAM")
-            print("Consider using CSSVMDualQPSolver for large datasets")
+        n = X.shape[0]
 
         X = np.ascontiguousarray(X, dtype=np.float64)
         y = np.where(y > 0, 1.0, -1.0).astype(np.float64)
 
-        # Предвычисляем матрицу Q
+        # Предвычисляем K и Q
         K = np.dot(X, X.T)
-        YY = np.outer(y, y)
-        Q = YY * K
-        Q += 1e-12 * np.eye(n_samples)  # Регуляризация
 
-        q = np.array([1.0 if y_i > 0 else self.kappa for y_i in y], dtype=np.float64)
-        C = np.array([self.C_upper_pos if y_i > 0 else self.C_upper_neg for y_i in y], dtype=np.float64)
+        q = np.array([1.0 if y_i > 0 else self.kappa for y_i in y])
+        C = np.array([self.C_upper_pos if y_i > 0 else self.C_upper_neg for y_i in y])
+        margins = np.array([1.0 if y_i > 0 else self.kappa for y_i in y])
 
-        alpha = np.zeros(n_samples, dtype=np.float64)
-        gradient = q.copy()
+        alpha = np.zeros(n)
+        b = 0.0
+        f_vals = np.zeros(n)  # f(x_i) = Σ α_j y_j K_ji + b
 
         converged = False
         n_iter = 0
@@ -790,58 +622,106 @@ class CSSVMDualQPSolverFast:
         for iteration in range(self.max_iter):
             n_iter = iteration + 1
 
-            i, j, found = select_working_set_wss3(alpha, gradient, y, C, self.eps, self.tol)
+            # Вычисляем E_i = f(x_i) - y_i * m_i
+            E = f_vals - y * margins
 
-            if not found:
+            # Выбор рабочей пары
+            neg_yE = -y * E
+
+            # I_up
+            max_i = -1
+            max_val = -np.inf
+            for k in range(n):
+                in_up = (y[k] > 0 and alpha[k] < C[k] - self.eps) or (y[k] < 0 and alpha[k] > self.eps)
+                if in_up and neg_yE[k] > max_val:
+                    max_val = neg_yE[k]
+                    max_i = k
+
+            if max_i < 0:
                 converged = True
                 break
 
-            # Оптимизация пары с использованием предвычисленной Q
-            alpha_i_old, alpha_j_old = alpha[i], alpha[j]
+            # I_down
+            min_j = -1
+            min_val = np.inf
+            for k in range(n):
+                in_down = (y[k] > 0 and alpha[k] > self.eps) or (y[k] < 0 and alpha[k] < C[k] - self.eps)
+                if in_down and neg_yE[k] < min_val:
+                    min_val = neg_yE[k]
+                    min_j = k
 
-            L, H = compute_bounds(alpha_i_old, alpha_j_old, y[i], y[j], C[i], C[j])
+            if min_j < 0 or max_val - min_val < self.tol:
+                converged = True
+                break
+
+            i, j = max_i, min_j
+
+            # Оптимизация пары
+            alpha_i_old, alpha_j_old = alpha[i], alpha[j]
+            y_i, y_j = y[i], y[j]
+
+            if y_i != y_j:
+                L = max(0.0, alpha_j_old - alpha_i_old)
+                H = min(C[j], C[i] + alpha_j_old - alpha_i_old)
+            else:
+                L = max(0.0, alpha_i_old + alpha_j_old - C[i])
+                H = min(C[j], alpha_i_old + alpha_j_old)
+
             if L >= H - self.eps:
                 continue
 
-            eta = Q[i, i] + Q[j, j] - 2.0 * y[i] * y[j] * Q[i, j] / (y[i] * y[j]) if y[i] * y[j] != 0 else Q[i, i] + Q[j, j] - 2.0 * Q[i, j]
-            # Simplified: since Q[i,j] = y[i]*y[j]*K[i,j], we have K[i,j] = Q[i,j]*y[i]*y[j]
-            K_ij = Q[i, j] * y[i] * y[j]
-            eta = Q[i, i] + Q[j, j] - 2.0 * K_ij
-
-            E_i = -y[i] * gradient[i]
-            E_j = -y[j] * gradient[j]
+            eta = K[i, i] + K[j, j] - 2 * K[i, j]
 
             if eta > self.eps:
-                alpha_j_new = alpha_j_old + y[j] * (E_i - E_j) / eta
+                alpha_j_new = alpha_j_old + y_j * (E[i] - E[j]) / eta
             else:
                 alpha_j_new = alpha_j_old
 
             alpha_j_new = np.clip(alpha_j_new, L, H)
 
-            if abs(alpha_j_new - alpha_j_old) < self.eps * (alpha_j_old + alpha_j_new + self.eps):
+            if abs(alpha_j_new - alpha_j_old) < self.eps:
                 continue
 
-            alpha_i_new = alpha_i_old + y[i] * y[j] * (alpha_j_old - alpha_j_new)
-            alpha_i_new = np.clip(alpha_i_new, 0.0, C[i])
+            alpha_i_new = alpha_i_old + y_i * y_j * (alpha_j_old - alpha_j_new)
+            alpha_i_new = np.clip(alpha_i_new, 0, C[i])
 
-            delta_alpha_i = alpha_i_new - alpha_i_old
-            delta_alpha_j = alpha_j_new - alpha_j_old
+            delta_i = alpha_i_new - alpha_i_old
+            delta_j = alpha_j_new - alpha_j_old
 
             alpha[i] = alpha_i_new
             alpha[j] = alpha_j_new
 
-            # Быстрое обновление градиента с Q
-            gradient -= delta_alpha_i * Q[:, i] + delta_alpha_j * Q[:, j]
+            # Обновляем f_vals
+            f_vals += delta_i * y_i * K[i, :] + delta_j * y_j * K[j, :]
 
-            if (iteration + 1) % 100 == 0:
-                kkt_violation = check_kkt_violation(alpha, gradient, y, C, self.eps)
-                if kkt_violation < self.tol:
-                    converged = True
-                    break
+            # Обновляем b
+            n_free = 0
+            b_sum = 0.0
+            for k in range(n):
+                if self.eps < alpha[k] < C[k] - self.eps:
+                    b_sum += y[k] * margins[k] - f_vals[k]
+                    n_free += 1
 
-        b = compute_bias_from_gradient(alpha, gradient, y, C, self.eps)
+            if n_free > 0:
+                b_delta = b_sum / n_free
+                f_vals += b_delta
+                b += b_delta
+
         n_sv = int(np.sum(alpha > self.eps))
-        obj = np.dot(q, alpha) - 0.5 * np.dot(alpha, np.dot(Q, alpha))
+
+        # Objective
+        linear_part = np.dot(q, alpha)
+        sv_mask = alpha > self.eps
+        if np.any(sv_mask):
+            sv_idx = np.where(sv_mask)[0]
+            alpha_sv = alpha[sv_idx]
+            y_sv = y[sv_idx]
+            K_sv = K[np.ix_(sv_idx, sv_idx)]
+            Q_sv = np.outer(y_sv, y_sv) * K_sv
+            quad_part = 0.5 * np.dot(alpha_sv, np.dot(Q_sv, alpha_sv))
+            obj = linear_part - quad_part
+        else:
+            obj = linear_part
 
         return SMOResult(
             alpha=alpha,
