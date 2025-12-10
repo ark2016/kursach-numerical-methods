@@ -17,6 +17,7 @@ import cvxopt
 from cvxopt import matrix, solvers
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.metrics import compute_all_metrics_at_k
+from cvxopt import spmatrix
 
 # Отключаем вывод cvxopt
 solvers.options['show_progress'] = False
@@ -48,7 +49,7 @@ CONFIG = {
 
     # MLFLOW Settings
     "mlflow_tracking_uri": "http://localhost:5000",
-    "experiment_name": "Encoder_Comparison_CS_SVM_QP",
+    "experiment_name": "Encoder_Comparison_CS_SVM_Primal",
     "s3_endpoint": "http://localhost:9000",
     "s3_access_key": "minio_root",
     "s3_secret_key": "minio_password"
@@ -73,6 +74,101 @@ os.environ["MLFLOW_S3_IGNORE_TLS"] = "true"
 
 # Создаем папку для кэша
 os.makedirs(CONFIG["cache_dir"], exist_ok=True)
+
+class BinaryCSSVM_Primal_Torch(torch.nn.Module):
+    """
+    Решает ПРЯМУЮ задачу CS-SVM (Equation 49 из статьи) через SGD/Adam на GPU.
+    """
+
+    def __init__(self, n_features, C_slack=1.0, C_pos=3.0, C_neg=2.0, 
+                 device="cuda", epochs=500, lr=0.01):
+        super().__init__()
+        self.device = device
+        self.epochs = epochs
+        self.lr = lr
+        
+        # Параметры из статьи
+        self.kappa = 1.0 / (2 * C_neg - 1)
+        
+        # Коэффициенты штрафа (Equation 49)
+        self.weight_pos = C_slack * C_pos
+        self.weight_neg = C_slack / self.kappa
+        
+        # Параметры модели (w и b)
+        # Инициализируем маленькими случайными числами
+        self.w = torch.nn.Parameter(torch.randn(n_features, 1, device=device) * 0.01)
+        self.b = torch.nn.Parameter(torch.zeros(1, device=device))
+
+    def forward(self, x):
+        return x @ self.w + self.b
+
+    def fit(self, X, y):
+        # Конвертация данных на GPU
+        # Если пришел numpy array, конвертируем в тензор
+        if not isinstance(X, torch.Tensor):
+            X = torch.tensor(X, dtype=torch.float32)
+        else:
+            X = X.to(dtype=torch.float32)
+
+        if not isinstance(y, torch.Tensor):
+            y = torch.tensor(y, dtype=torch.float32)
+        else:
+            y = y.to(dtype=torch.float32)
+            
+        X = X.to(self.device)
+        y = y.to(self.device).reshape(-1, 1) # {-1, 1}
+        
+        # Маски для векторизованного расчета Loss
+        pos_mask = (y > 0)
+        neg_mask = (y < 0)
+        
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        
+        self.train()
+        for epoch in range(self.epochs):
+            optimizer.zero_grad()
+            
+            # Forward pass
+            outputs = self.forward(X)
+            
+            # --- Расчет Loss (строго по статье ур. 49) ---
+            
+            # 1. Hinge Loss для позитивных примеров (y=+1)
+            # Constraint: ξ >= 1 - (w*x + b)
+            loss_pos = torch.tensor(0.0, device=self.device)
+            if pos_mask.any():
+                out_pos = outputs[pos_mask]
+                loss_pos = self.weight_pos * torch.sum(torch.relu(1.0 - out_pos))
+            
+            # 2. Hinge Loss для негативных примеров (y=-1)
+            # Constraint: ξ >= (w*x + b) + kappa
+            loss_neg = torch.tensor(0.0, device=self.device)
+            if neg_mask.any():
+                out_neg = outputs[neg_mask]
+                loss_neg = self.weight_neg * torch.sum(torch.relu(out_neg + self.kappa))
+            
+            # 3. Регуляризация ||w||^2
+            l2_reg = 0.5 * torch.sum(self.w ** 2)
+            
+            # Итоговый лосс
+            loss = l2_reg + loss_pos + loss_neg
+            
+            loss.backward()
+            optimizer.step()
+
+        return self
+
+    # --- Свойства для безопасного извлечения весов в NumPy ---
+    @property
+    def w_cpu(self):
+        """Возвращает веса w как одномерный numpy array на CPU"""
+        return self.w.detach().cpu().numpy().flatten()
+    
+    @property
+    def b_cpu(self):
+        """Возвращает смещение b как скаляр на CPU"""
+        return self.b.detach().cpu().numpy().item()
+
 
 class BinaryCSSVM_QP:
     """
@@ -127,90 +223,103 @@ class BinaryCSSVM_QP:
     def fit(self, X, y):
         """
         Обучение CS-SVM через решение двойственной задачи квадратичного программирования.
-
-        Args:
-            X: numpy array (n_samples, n_features) - обучающие данные
-            y: numpy array (n_samples,) - метки классов {-1, +1}
+        ИСПРАВЛЕНО: Использование разреженных матриц для G.
         """
         n_samples, n_features = X.shape
 
         # Конвертируем метки в {-1, +1}
         y = np.where(y > 0, 1, -1).astype(np.float64)
 
-        # Вычисление матрицы ядра K (линейное ядро: K = X @ X.T)
+        # ----------------------------------------------------------------------
+        # 1. Матрица P (Kernel Matrix * Labels)
+        # ВНИМАНИЕ: P остается плотной. Для 43k сэмплов она займет ~14 ГБ RAM.
+        # Если упадет с MemoryError, придется переходить на Primal SGD.
+        # ----------------------------------------------------------------------
         K = np.dot(X, X.T)
-
-        # Матрица P для QP: P = Y K Y, где Y = diag(y)
-        # P_ij = y_i * y_j * K_ij
         YY = np.outer(y, y)
         P = YY * K
-
-        # Добавляем небольшую регуляризацию для численной стабильности
-        P = P + 1e-8 * np.eye(n_samples)
-
-        # Вектор q для QP (минимизируем 1/2 α^T P α - q^T α)
-        # Из статьи (ур. 51): линейный член = α_i[(y_i+1)/2 - κ(y_i-1)/2]
-        # Для y_i = +1: (1+1)/2 - κ(1-1)/2 = 1
-        # Для y_i = -1: (-1+1)/2 - κ(-1-1)/2 = 0 + κ = κ
-        q = np.where(y > 0, 1.0, self.kappa)
-
-        # Конвертация в формат cvxopt
+        P = P + 1e-8 * np.eye(n_samples) # Численная стабильность
+        
         P_cvx = matrix(P.astype(np.float64))
-        q_cvx = matrix(-q.astype(np.float64))  # Минус, т.к. cvxopt минимизирует
+        
+        # ----------------------------------------------------------------------
+        # 2. Вектор q
+        # ----------------------------------------------------------------------
+        q = np.where(y > 0, 1.0, self.kappa)
+        q_cvx = matrix(-q.astype(np.float64))
 
-        # Ограничение равенства: Σ α_i y_i = 0
+        # ----------------------------------------------------------------------
+        # 3. Ограничения Gx <= h (Box constraints) через Sparse Matrix
+        #
+        # Нам нужно закодировать:
+        #  -α_i <= 0      (для всех i) -> индексы 0..N-1
+        #   α_i <= upper  (для всех i) -> индексы N..2N-1
+        #
+        # Матрица G (2N x N) будет иметь вид:
+        # [-I ]
+        # [ I ]
+        # ----------------------------------------------------------------------
+        
+        # Значения: N раз по -1.0, затем N раз по 1.0
+        values = [-1.0] * n_samples + [1.0] * n_samples
+        
+        # Индексы строк (I): 0, 1, ..., 2N-1
+        rows = list(range(2 * n_samples))
+        
+        # Индексы столбцов (J): 0, 1, ..., N-1, затем снова 0, 1, ..., N-1
+        cols = list(range(n_samples)) * 2
+        
+        # Создаем разреженную матрицу G
+        G_cvx = spmatrix(values, rows, cols, (2 * n_samples, n_samples))
+
+        # Вектор h (правая часть неравенств)
+        h_lower = np.zeros(n_samples)
+        h_upper = np.where(y > 0, self.alpha_upper_pos, self.alpha_upper_neg)
+        h_combined = np.hstack([h_lower, h_upper])
+        
+        h_cvx = matrix(h_combined.astype(np.float64))
+
+        # ----------------------------------------------------------------------
+        # 4. Равенство A x = b (сумма alpha * y = 0)
+        # ----------------------------------------------------------------------
         A_eq = matrix(y.reshape(1, -1).astype(np.float64))
         b_eq = matrix(np.zeros(1).astype(np.float64))
 
-        # Ограничения неравенства для box constraints: 0 ≤ α_i ≤ upper_i
-        # Представляем как: -α_i ≤ 0 и α_i ≤ upper_i
-        # G α ≤ h
-        G_lower = -np.eye(n_samples)
-        h_lower = np.zeros(n_samples)
-
-        G_upper = np.eye(n_samples)
-        # Верхние границы зависят от класса (уравнение 51)
-        h_upper = np.where(y > 0, self.alpha_upper_pos, self.alpha_upper_neg)
-
-        G = np.vstack([G_lower, G_upper])
-        h = np.hstack([h_lower, h_upper])
-
-        G_cvx = matrix(G.astype(np.float64))
-        h_cvx = matrix(h.astype(np.float64))
-
-        # Решение QP задачи
+        # ----------------------------------------------------------------------
+        # 5. Решение
+        # ----------------------------------------------------------------------
+        # Чистим память перед запуском солвера (удаляем тяжелые numpy массивы)
+        del K, YY, P, values, rows, cols
+        import gc
+        gc.collect()
+        
         solution = solvers.qp(P_cvx, q_cvx, G_cvx, h_cvx, A_eq, b_eq)
 
         if solution['status'] != 'optimal':
             print(f"Warning: QP solver status = {solution['status']}")
 
-        # Извлечение множителей Лагранжа
         alphas = np.array(solution['x']).flatten()
 
-        # Находим опорные векторы (α_i > threshold)
-        sv_threshold = 1e-6
+        # Находим опорные векторы
+        sv_threshold = 1e-5
         sv_indices = alphas > sv_threshold
 
         self.alphas = alphas[sv_indices]
         self.support_vectors = X[sv_indices]
         self.support_vector_labels = y[sv_indices]
 
-        # Вычисление w = Σ α_i y_i x_i
+        # Вычисление w
         self.w = np.sum(
             (alphas * y).reshape(-1, 1) * X,
             axis=0
         )
 
-        # Вычисление b из условий KKT
-        # Для опорных векторов на границе используем:
-        # Для y_i = +1: b = 1 - w^T x_i (если 0 < α_i < C·C₁)
-        # Для y_i = -1: b = -κ - w^T x_i (если 0 < α_i < C/κ)
+        # Вычисление b (усреднение по свободным SV)
         b_values = []
         for i in range(n_samples):
             if sv_threshold < alphas[i]:
                 upper_bound = self.alpha_upper_pos if y[i] > 0 else self.alpha_upper_neg
                 if alphas[i] < upper_bound - sv_threshold:
-                    # Свободный опорный вектор (не на границе)
                     wx = np.dot(self.w, X[i])
                     if y[i] > 0:
                         b_values.append(1.0 - wx)
@@ -220,7 +329,7 @@ class BinaryCSSVM_QP:
         if len(b_values) > 0:
             self.b = np.mean(b_values)
         else:
-            # Если нет свободных SV, используем все опорные векторы
+            # Fallback
             b_all = []
             for i in np.where(sv_indices)[0]:
                 wx = np.dot(self.w, X[i])
@@ -231,6 +340,7 @@ class BinaryCSSVM_QP:
             self.b = np.mean(b_all) if b_all else 0.0
 
         return self
+
 
     def decision_function(self, X):
         """Вычисление значения решающей функции f(x) = w^T x + b"""
@@ -244,28 +354,16 @@ class BinaryCSSVM_QP:
 class MultilabelCSSVM_QP:
     """
     Multilabel CS-SVM с One-vs-Rest стратегией.
-
-    Для каждого класса обучается отдельный бинарный CS-SVM через QP.
-    Стоимости ошибок вычисляются адаптивно на основе дисбаланса классов.
+    Использует Primal-форму на GPU для скорости.
     """
 
     def __init__(self, num_classes, class_counts, total_samples,
                  C_slack=1.0, C_pos_base=3.0, C_neg_base=2.0):
-        """
-        Args:
-            num_classes: Количество классов
-            class_counts: numpy array - количество примеров каждого класса
-            total_samples: Общее количество примеров
-            C_slack: Базовый параметр регуляризации
-            C_pos_base: Базовая стоимость FN
-            C_neg_base: Базовая стоимость FP
-        """
         self.num_classes = num_classes
         self.C_slack = C_slack
         self.C_neg_base = C_neg_base
 
         # Адаптивное вычисление C_pos для каждого класса на основе дисбаланса
-        # (как в оригинальной реализации, но с учётом ограничений статьи)
         neg_counts = total_samples - class_counts
         imbalance_ratios = neg_counts / (class_counts + 1e-6)
         c_pos_calculated = imbalance_ratios * C_neg_base
@@ -279,37 +377,47 @@ class MultilabelCSSVM_QP:
     def fit(self, X, Y):
         """
         Обучение One-vs-Rest классификаторов.
-
-        Args:
-            X: numpy array (n_samples, n_features)
-            Y: numpy array (n_samples, num_classes) - бинарные метки
         """
         n_samples, n_features = X.shape
+        # Инициализируем массивы весов (NumPy)
         self.w = np.zeros((n_features, self.num_classes))
         self.b = np.zeros(self.num_classes)
         self.classifiers = []
 
-        for c in tqdm(range(self.num_classes), desc="Training CS-SVM QP"):
+        # Progress bar для отслеживания обучения классов
+        for c in tqdm(range(self.num_classes), desc="Training CS-SVM Primal (GPU)"):
             # Преобразуем метки: 1 -> +1, 0 -> -1
             y_binary = np.where(Y[:, c] > 0, 1, -1)
 
-            # Создаём классификатор с адаптивной стоимостью для этого класса
-            clf = BinaryCSSVM_QP(
+            # Используем Torch реализацию (Primal form)
+            clf = BinaryCSSVM_Primal_Torch(
+                n_features=n_features,
                 C_slack=self.C_slack,
                 C_pos=self.C_pos_per_class[c],
-                C_neg=self.C_neg_base
+                C_neg=self.C_neg_base,
+                device=CONFIG["device"], 
+                epochs=1000,             
+                lr=0.005
             )
+            # Создаём классификатор с адаптивной стоимостью для этого класса
+            # clf = BinaryCSSVM_QP( # работает слишком долго и требует 70 Gb RAM
+            #     C_slack=self.C_slack,
+            #     C_pos=self.C_pos_per_class[c],
+            #     C_neg=self.C_neg_base
+            # )
 
             clf.fit(X, y_binary)
             self.classifiers.append(clf)
 
-            self.w[:, c] = clf.w
-            self.b[c] = clf.b
+            # --- ИСПРАВЛЕНИЕ ЗДЕСЬ ---
+            # Берем веса через свойство w_cpu, которое делает .detach().cpu().numpy()
+            self.w[:, c] = clf.w_cpu
+            self.b[c] = clf.b_cpu
 
         return self
 
     def decision_function(self, X):
-        """Вычисление решающей функции для всех классов"""
+        """Вычисление решающей функции для всех классов (на CPU)"""
         return np.dot(X, self.w) + self.b
 
     def predict(self, X):
@@ -318,29 +426,9 @@ class MultilabelCSSVM_QP:
         return (scores > 0).astype(np.float32)
 
     def predict_proba(self, X):
-        """Возвращает scores (не вероятности, но можно использовать для ранжирования)"""
+        """Возвращает scores"""
         return self.decision_function(X)
 
-def load_encoder(model_path):
-    print(f"Loading encoder: {model_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    try:
-        peft_config = PeftConfig.from_pretrained(model_path)
-        base_model = AutoModelForSequenceClassification.from_pretrained(
-            peft_config.base_model_name_or_path,
-            num_labels=28,
-            output_hidden_states=True,
-            problem_type="multi_label_classification"
-        )
-        model = PeftModel.from_pretrained(base_model, model_path)
-        print(" -> Detected PEFT/LoRA adapter (Loaded as SeqCls).")
-    except Exception:
-        # Для обычных моделей (Baseline, Foreign) грузим просто AutoModel
-        model = AutoModel.from_pretrained(model_path)
-        print(f" -> Detected Standard Transformer (Base/Full).")
-    model.to(CONFIG['device'])
-    model.eval()
-    return model, tokenizer
 
 def get_embeddings(model_key, model_path, dataset, mlb):
     safe_name = model_key.replace("/", "_")
