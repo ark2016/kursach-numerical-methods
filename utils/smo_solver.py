@@ -147,7 +147,8 @@ def update_gradients(
         K_jk = np.dot(X[j], X[k])
         # Q[k, i] = y[k] * y[i] * K[k, i]
         # Q[k, j] = y[k] * y[j] * K[k, j]
-        G[k] += delta_alpha_i * y_i * K_ik + delta_alpha_j * y_j * K_jk
+        y_k = y[k]
+        G[k] += delta_alpha_i * y_i * y_k * K_ik + delta_alpha_j * y_j * y_k * K_jk
 
 
 @njit(fastmath=True, cache=True)
@@ -747,8 +748,9 @@ class CSSVMDualQPSolverFast:
 
             # Обновляем градиенты
             # G += delta_i * Q[:, i] + delta_j * Q[:, j]
-            # Q[:, k] = y[k] * y[:] * K[:, k]
-            G += delta_i * y_i * K[i, :] + delta_j * y_j * K[j, :]
+            # Q[k, i] = y[k] * y[i] * K[k, i]
+            # Векторизованная версия: G += delta_i * y_i * (y ⊙ K[i, :]) + delta_j * y_j * (y ⊙ K[j, :])
+            G += delta_i * y_i * (y * K[i, :]) + delta_j * y_j * (y * K[j, :])
 
         # Вычисляем bias
         n_free = 0
