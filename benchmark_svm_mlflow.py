@@ -13,13 +13,9 @@ from sklearn.preprocessing import StandardScaler
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 from peft import PeftModel, PeftConfig
-import cvxopt
-from cvxopt import matrix, solvers
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.metrics import compute_all_metrics_at_k
-
-# Отключаем вывод cvxopt
-solvers.options['show_progress'] = False
+from utils.smo_solver import solve_cssvm_dual_qp, CSSVMDualQPSolver
 
 # --- КОНФИГУРАЦИЯ ---
 CONFIG = {
@@ -37,6 +33,11 @@ CONFIG = {
     "C_slack": 1.0,       # Параметр C (slack penalty)
     "C_pos": 3.0,         # C_1: стоимость FN (должно быть >= 2*C_neg - 1)
     "C_neg": 2.0,         # C_{-1}: стоимость FP (должно быть >= 1)
+
+    # SMO solver параметры
+    "smo_tol": 1e-3,      # Допуск для KKT условий
+    "smo_max_iter": 10000, # Максимум итераций SMO
+    "smo_verbose": False,  # Выводить прогресс SMO
 
     # Baseline sklearn SVM
     "run_sklearn_baseline": True,
@@ -93,23 +94,33 @@ class BinaryCSSVM_QP:
              0 ≤ α_i ≤ C/κ    ; y_i = -1
 
     где κ = 1/(2C_{-1} - 1), условия: C_{-1} ≥ 1, C₁ ≥ 2C_{-1} - 1
+
+    Оптимизация выполняется кастомным SMO (Sequential Minimal Optimization) солвером.
     """
 
-    def __init__(self, C_slack=1.0, C_pos=3.0, C_neg=2.0):
+    def __init__(self, C_slack=1.0, C_pos=3.0, C_neg=2.0, tol=1e-3, max_iter=10000, verbose=False):
         """
         Args:
             C_slack: Параметр регуляризации C (slack penalty)
             C_pos: C₁ - стоимость ошибки на положительном классе (false negative)
             C_neg: C_{-1} - стоимость ошибки на отрицательном классе (false positive)
+            tol: Допуск сходимости для SMO
+            max_iter: Максимальное количество итераций SMO
+            verbose: Выводить прогресс обучения
         """
         # Проверка условий из статьи (уравнение 50)
-        assert C_neg >= 1.0, f"C_neg должно быть >= 1, получено {C_neg}"
+        if C_neg < 1.0:
+            raise ValueError(f"C_neg должно быть >= 1, получено {C_neg}")
         min_c_pos = 2 * C_neg - 1
-        assert C_pos >= min_c_pos, f"C_pos должно быть >= {min_c_pos}, получено {C_pos}"
+        if C_pos < min_c_pos:
+            raise ValueError(f"C_pos должно быть >= {min_c_pos}, получено {C_pos}")
 
         self.C = C_slack
         self.C_pos = C_pos  # C₁
         self.C_neg = C_neg  # C_{-1}
+        self.tol = tol
+        self.max_iter = max_iter
+        self.verbose = verbose
 
         # κ = 1/(2C_{-1} - 1) (уравнение 50)
         self.kappa = 1.0 / (2 * C_neg - 1)
@@ -123,69 +134,38 @@ class BinaryCSSVM_QP:
         self.support_vectors = None
         self.support_vector_labels = None
         self.alphas = None
+        self.n_support_vectors = 0
+        self.converged = False
 
     def fit(self, X, y):
         """
-        Обучение CS-SVM через решение двойственной задачи квадратичного программирования.
+        Обучение CS-SVM через решение двойственной задачи методом SMO.
+
+        Sequential Minimal Optimization (SMO) решает QP задачу итеративно,
+        оптимизируя по паре переменных за раз с сохранением ограничения
+        Σ α_i y_i = 0.
 
         Args:
             X: numpy array (n_samples, n_features) - обучающие данные
-            y: numpy array (n_samples,) - метки классов {-1, +1}
+            y: numpy array (n_samples,) - метки классов {0, 1} или {-1, +1}
+
+        Returns:
+            self: Обученная модель
         """
-        n_samples, n_features = X.shape
-
         # Конвертируем метки в {-1, +1}
-        y = np.where(y > 0, 1, -1).astype(np.float64)
+        y_normalized = np.where(y > 0, 1.0, -1.0).astype(np.float64)
 
-        # Вычисление матрицы ядра K (линейное ядро: K = X @ X.T)
-        K = np.dot(X, X.T)
-
-        # Матрица P для QP: P = Y K Y, где Y = diag(y)
-        # P_ij = y_i * y_j * K_ij
-        YY = np.outer(y, y)
-        P = YY * K
-
-        # Добавляем небольшую регуляризацию для численной стабильности
-        P = P + 1e-8 * np.eye(n_samples)
-
-        # Вектор q для QP (минимизируем 1/2 α^T P α - q^T α)
-        # Из статьи (ур. 51): линейный член = α_i[(y_i+1)/2 - κ(y_i-1)/2]
-        # Для y_i = +1: (1+1)/2 - κ(1-1)/2 = 1
-        # Для y_i = -1: (-1+1)/2 - κ(-1-1)/2 = 0 + κ = κ
-        q = np.where(y > 0, 1.0, self.kappa)
-
-        # Конвертация в формат cvxopt
-        P_cvx = matrix(P.astype(np.float64))
-        q_cvx = matrix(-q.astype(np.float64))  # Минус, т.к. cvxopt минимизирует
-
-        # Ограничение равенства: Σ α_i y_i = 0
-        A_eq = matrix(y.reshape(1, -1).astype(np.float64))
-        b_eq = matrix(np.zeros(1).astype(np.float64))
-
-        # Ограничения неравенства для box constraints: 0 ≤ α_i ≤ upper_i
-        # Представляем как: -α_i ≤ 0 и α_i ≤ upper_i
-        # G α ≤ h
-        G_lower = -np.eye(n_samples)
-        h_lower = np.zeros(n_samples)
-
-        G_upper = np.eye(n_samples)
-        # Верхние границы зависят от класса (уравнение 51)
-        h_upper = np.where(y > 0, self.alpha_upper_pos, self.alpha_upper_neg)
-
-        G = np.vstack([G_lower, G_upper])
-        h = np.hstack([h_lower, h_upper])
-
-        G_cvx = matrix(G.astype(np.float64))
-        h_cvx = matrix(h.astype(np.float64))
-
-        # Решение QP задачи
-        solution = solvers.qp(P_cvx, q_cvx, G_cvx, h_cvx, A_eq, b_eq)
-
-        if solution['status'] != 'optimal':
-            print(f"Warning: QP solver status = {solution['status']}")
-
-        # Извлечение множителей Лагранжа
-        alphas = np.array(solution['x']).flatten()
+        # Решаем двойственную задачу QP кастомным SMO-солвером
+        self.w, self.b, alphas = solve_cssvm_dual_qp(
+            X=X,
+            y=y_normalized,
+            C_slack=self.C,
+            C_pos=self.C_pos,
+            C_neg=self.C_neg,
+            tol=self.tol,
+            max_iter=self.max_iter,
+            verbose=self.verbose
+        )
 
         # Находим опорные векторы (α_i > threshold)
         sv_threshold = 1e-6
@@ -193,42 +173,8 @@ class BinaryCSSVM_QP:
 
         self.alphas = alphas[sv_indices]
         self.support_vectors = X[sv_indices]
-        self.support_vector_labels = y[sv_indices]
-
-        # Вычисление w = Σ α_i y_i x_i
-        self.w = np.sum(
-            (alphas * y).reshape(-1, 1) * X,
-            axis=0
-        )
-
-        # Вычисление b из условий KKT
-        # Для опорных векторов на границе используем:
-        # Для y_i = +1: b = 1 - w^T x_i (если 0 < α_i < C·C₁)
-        # Для y_i = -1: b = -κ - w^T x_i (если 0 < α_i < C/κ)
-        b_values = []
-        for i in range(n_samples):
-            if sv_threshold < alphas[i]:
-                upper_bound = self.alpha_upper_pos if y[i] > 0 else self.alpha_upper_neg
-                if alphas[i] < upper_bound - sv_threshold:
-                    # Свободный опорный вектор (не на границе)
-                    wx = np.dot(self.w, X[i])
-                    if y[i] > 0:
-                        b_values.append(1.0 - wx)
-                    else:
-                        b_values.append(-self.kappa - wx)
-
-        if len(b_values) > 0:
-            self.b = np.mean(b_values)
-        else:
-            # Если нет свободных SV, используем все опорные векторы
-            b_all = []
-            for i in np.where(sv_indices)[0]:
-                wx = np.dot(self.w, X[i])
-                if y[i] > 0:
-                    b_all.append(1.0 - wx)
-                else:
-                    b_all.append(-self.kappa - wx)
-            self.b = np.mean(b_all) if b_all else 0.0
+        self.support_vector_labels = y_normalized[sv_indices]
+        self.n_support_vectors = np.sum(sv_indices)
 
         return self
 
