@@ -368,11 +368,13 @@ class BinaryCSSVM_WSS:
     def __init__(self, C_slack=1.0, C_pos=3.0, C_neg=2.0,
                  working_set_size=200, max_iter=1000, tol=1e-3,
                  shrinking=True, verbose=False,
-                 adaptive_ws=True, patience=10):
+                 adaptive_ws=True, patience=10,
+                 max_cache_size_mb=100):
         """
         Args:
             adaptive_ws: Адаптивно изменять размер working set
             patience: Количество итераций без улучшения для early stopping
+            max_cache_size_mb: Максимальный размер кэша в мегабайтах
         """
         assert C_neg >= 1.0, f"C_neg должно быть >= 1, получено {C_neg}"
         min_c_pos = 2 * C_neg - 1
@@ -393,6 +395,7 @@ class BinaryCSSVM_WSS:
         self.verbose = verbose
         self.adaptive_ws = adaptive_ws
         self.patience = patience
+        self.max_cache_size_mb = max_cache_size_mb
 
         # Результаты
         self.w = None
@@ -405,10 +408,23 @@ class BinaryCSSVM_WSS:
         self._kernel_cache = {}
         self._cache_hits = 0
         self._cache_misses = 0
+        self._current_cache_size_bytes = 0
         
     def fit(self, X, y):
         """Обучение через Working Set Selection с оптимизациями."""
         n_samples, n_features = X.shape
+        
+        # ДОБАВИТЬ: Проверка на вырожденные случаи
+        if n_samples < 10:
+            warnings.warn("Too few samples, falling back to simple QP solve")
+            # Используем простое QP решение
+            return self._fit_simple_qp(X, y)
+        
+        # Проверка на чистую линейную разделимость
+        unique_y = np.unique(y)
+        if len(unique_y) == 1:
+            raise ValueError("All samples have the same label!")
+        
         y = np.where(y > 0, 1, -1).astype(np.float64)
 
         # Инициализация
@@ -563,7 +579,15 @@ class BinaryCSSVM_WSS:
         q = len(B)
         if q == 0:
             return alphas[B]
-
+        
+        # Проверка: если только одна переменная, упрощаем
+        if q == 1:
+            i = B[0]
+            # Аналитическое решение для одной переменной
+            alpha_new = alphas[i] - gradients[i] / (X[i] @ X[i] + 1e-8)
+            alpha_new = np.clip(alpha_new, 0, C_upper[i])
+            return np.array([alpha_new])
+        
         # Проверяем кэш для kernel matrix
         B_tuple = tuple(sorted(B))
         if B_tuple in self._kernel_cache:
@@ -572,50 +596,87 @@ class BinaryCSSVM_WSS:
         else:
             X_B = X[B]
             K_BB = X_B @ X_B.T
-
-            # Кэшируем если размер разумный
-            if len(self._kernel_cache) < 100:  # Максимум 100 матриц в кэше
+            
+            # Вычисляем размер в байтах
+            matrix_size_bytes = K_BB.nbytes
+            max_cache_bytes = self.max_cache_size_mb * 1024 * 1024
+            
+            # Освобождаем память если нужно (FIFO)
+            while (self._current_cache_size_bytes + matrix_size_bytes > max_cache_bytes 
+                   and len(self._kernel_cache) > 0):
+                # Удаляем первый (старейший) элемент
+                old_key = next(iter(self._kernel_cache))
+                old_matrix = self._kernel_cache.pop(old_key)
+                self._current_cache_size_bytes -= old_matrix.nbytes
+            
+            # Добавляем новый
+            if matrix_size_bytes < max_cache_bytes:
                 self._kernel_cache[B_tuple] = K_BB
+                self._current_cache_size_bytes += matrix_size_bytes
+            
             self._cache_misses += 1
 
-        # Остальное как раньше
         y_B = y[B]
         Q = (y_B.reshape(-1, 1) * y_B) * K_BB
-        Q = Q + 1e-8 * np.eye(q)
+        
+        # Улучшенная регуляризация для численной стабильности
+        # Adaptive epsilon на основе condition number
+        min_eig = np.min(np.linalg.eigvalsh(Q))
+        reg_eps = max(1e-8, -min_eig + 1e-6) if min_eig < 0 else 1e-8
+        Q = Q + reg_eps * np.eye(q)
 
         p = -gradients[B]
-        c = -(alphas @ y - alphas[B] @ y_B)
+        
+        # ВАЖНО: правильное вычисление c для equality constraint
+        # Constraint: sum(alpha[B] * y[B]) = -sum(alpha[not B] * y[not B])
+        all_indices = np.arange(len(alphas))
+        not_B = np.setdiff1d(all_indices, B)
+        c = -(alphas[not_B] @ y[not_B]) if len(not_B) > 0 else 0.0
 
         l_box = np.zeros(q)
         u_box = C_upper[B]
 
-        # OSQP setup
-        P_sparse = sparse.csc_matrix(Q)
-        A_sparse = sparse.csc_matrix(y_B.reshape(1, -1))
-
-        l_constraints = np.concatenate([[c], l_box])
-        u_constraints = np.concatenate([[c], u_box])
-
-        m = osqp.OSQP()
-        m.setup(
-            P=P_sparse, q=p, A=A_sparse,
-            l=l_constraints, u=u_constraints,
-            verbose=False,
-            eps_abs=1e-4,
-            eps_rel=1e-4,
-            max_iter=4000,
-            polish=True
-        )
-
-        results = m.solve()
-
-        if results.info.status != 'solved':
+        # OSQP setup с улучшенными настройками
+        try:
+            P_sparse = sparse.csc_matrix(Q)
+            A_sparse = sparse.csc_matrix(y_B.reshape(1, -1))
+            
+            l_constraints = np.concatenate([[c], l_box])
+            u_constraints = np.concatenate([[c], u_box])
+            
+            m = osqp.OSQP()
+            m.setup(
+                P=P_sparse, q=p, A=A_sparse,
+                l=l_constraints, u=u_constraints,
+                verbose=False,
+                eps_abs=1e-4,
+                eps_rel=1e-4,
+                max_iter=4000,
+                polish=True,
+                adaptive_rho=True,  # Улучшает сходимость
+                check_termination=25  # Проверяем сходимость чаще
+            )
+            
+            results = m.solve()
+            
+            if results.info.status != 'solved' and results.info.status != 'solved_inaccurate':
+                if self.verbose:
+                    warnings.warn(f"OSQP status: {results.info.status} for |B|={q}")
+                return alphas[B]  # Возвращаем старые значения
+            
+            alpha_B_new = np.clip(results.x, 0, C_upper[B])
+            
+            # Проверка: насколько изменились alphas
+            change = np.linalg.norm(alpha_B_new - alphas[B])
+            if change < 1e-10:
+                return alphas[B]  # Не обновляем если изменения минимальны
+            
+            return alpha_B_new
+            
+        except Exception as e:
             if self.verbose:
-                import warnings
-                warnings.warn(f"OSQP status: {results.info.status}")
+                warnings.warn(f"OSQP error: {e}, returning old alphas")
             return alphas[B]
-
-        return np.clip(results.x, 0, C_upper[B])
     
     def _apply_shrinking_vectorized(self, alphas, gradients, y, C_upper):
         """Векторизованная версия shrinking."""
@@ -676,21 +737,34 @@ class BinaryCSSVM_WSS:
         gradients[active_set] -= kernel_delta * y[active_set]
 
     def _adapt_working_set_size(self, max_violation, current_B_size, current_q):
-        """Адаптивно изменяет размер working set."""
-        # Если нарушение большое, увеличиваем q
-        # Если маленькое, уменьшаем q
-
+        """Адаптивно изменяет размер working set с более плавными изменениями."""
+        
+        # Более плавная адаптация на основе violation
         if max_violation > 0.1:
-            new_q = min(current_q + 50, 500)
+            # Большие нарушения - агрессивно увеличиваем
+            new_q = min(int(current_q * 1.25), 500)
+        elif max_violation > 0.05:
+            # Средние нарушения - умеренное увеличение
+            new_q = min(current_q + 25, 500)
+        elif max_violation < 0.005:
+            # Очень малые нарушения - агрессивно уменьшаем
+            new_q = max(int(current_q * 0.75), 50)
         elif max_violation < 0.01:
-            new_q = max(current_q - 50, 100)
+            # Малые нарушения - умеренное уменьшение
+            new_q = max(current_q - 25, 100)
         else:
             new_q = current_q
-
-        # Также учитываем, насколько заполнен working set
-        if current_B_size < current_q * 0.3:
-            new_q = max(new_q - 50, 100)
-
+        
+        # Проверка эффективности: если working set недоиспользован
+        if current_B_size < current_q * 0.2 and current_q > 100:
+            # Слишком много переменных не нарушают KKT
+            new_q = max(int(current_q * 0.8), 100)
+        
+        # Ограничиваем скорость изменения
+        max_change = 100
+        if abs(new_q - current_q) > max_change:
+            new_q = current_q + max_change if new_q > current_q else current_q - max_change
+        
         return new_q
 
     def _final_check(self, X, y, alphas, gradients, q_vec, C_upper, active_set):
@@ -723,10 +797,39 @@ class BinaryCSSVM_WSS:
                     kernel_delta = X @ temp
                     gradients -= kernel_delta * y
 
+    def _fit_simple_qp(self, X, y):
+        """Простое QP решение для малых наборов данных."""
+        # Используем стандартный QP solver для малых задач
+        simple_svm = BinaryCSSVM_QP(
+            C_slack=self.C,
+            C_pos=self.C_pos,
+            C_neg=self.C_neg
+        )
+        simple_svm.fit(X, y)
+        
+        # Копируем результаты
+        self.w = simple_svm.w
+        self.b = simple_svm.b
+        self.support_vectors = simple_svm.support_vectors
+        self.support_vector_labels = simple_svm.support_vector_labels
+        self.alphas = simple_svm.alphas
+        
+        return self
+
     def _finalize_solution(self, X, y, alphas, C_upper):
-        """Сохраняет финальное решение."""
+        """Сохраняет финальное решение с валидацией."""
         sv_threshold = 1e-5
         sv_indices = alphas > sv_threshold
+
+        # ДОБАВИТЬ: Проверка количества SV
+        n_sv = np.sum(sv_indices)
+        if n_sv == 0:
+            warnings.warn("No support vectors found! Model may be degenerate.")
+            # Fallback: используем все точки
+            sv_indices = np.ones(len(alphas), dtype=bool)
+
+        if self.verbose:
+            print(f"  Support vectors: {n_sv} / {len(alphas)} ({100*n_sv/len(alphas):.1f}%)")
 
         self.alphas = alphas[sv_indices]
         self.support_vectors = X[sv_indices]
@@ -735,8 +838,41 @@ class BinaryCSSVM_WSS:
         # Вычисляем w
         self.w = np.sum((alphas * y).reshape(-1, 1) * X, axis=0)
 
+        # ДОБАВИТЬ: Проверка нормы w
+        w_norm = np.linalg.norm(self.w)
+        if w_norm < 1e-10:
+            warnings.warn("Weight vector has near-zero norm! Model may be degenerate.")
+
         # Вычисляем b
         self.b = self._compute_bias(X, y, alphas, C_upper)
+        
+        # ДОБАВИТЬ: Финальная проверка KKT на train set
+        if self.verbose:
+            train_violations = self._compute_kkt_violations(X, y, alphas, C_upper)
+            print(f"  Final KKT violations: max={np.max(train_violations):.6f}, "
+                  f"mean={np.mean(train_violations):.6f}")
+
+    def _compute_kkt_violations(self, X, y, alphas, C_upper):
+        """Вычисляет нарушения KKT для диагностики."""
+        eps = 1e-8
+        
+        # Вычисляем градиенты
+        q_vec = np.where(y > 0, 1.0, self.kappa)
+        K_alpha_y = X @ (X.T @ (alphas * y))
+        gradients = q_vec - K_alpha_y * y
+        
+        yg = y * gradients
+        
+        violations = np.zeros(len(alphas))
+        at_lower = alphas < eps
+        at_upper = alphas > C_upper - eps
+        free = ~at_lower & ~at_upper
+        
+        violations[at_lower] = np.maximum(0, 1.0 - yg[at_lower])
+        violations[at_upper] = np.maximum(0, yg[at_upper] - 1.0)
+        violations[free] = np.abs(yg[free] - 1.0)
+        
+        return violations
 
     def _compute_bias(self, X, y, alphas, C_upper):
         """Вычисляет bias используя free support vectors."""
@@ -792,11 +928,12 @@ class MultilabelCSSVM_WSS:
     def __init__(self, num_classes, class_counts, total_samples,
                  C_slack=1.0, C_pos_base=3.0, C_neg_base=2.0,
                  working_set_size=200, max_iter=1000, verbose=False,
-                 adaptive_ws=True, patience=10):
+                 adaptive_ws=True, patience=10, max_cache_size_mb=100):
         """
         Args:
             adaptive_ws: Адаптивно изменять размер working set
             patience: Количество итераций без улучшения для early stopping
+            max_cache_size_mb: Максимальный размер кэша в мегабайтах
         """
         self.num_classes = num_classes
         self.C_slack = C_slack
@@ -806,6 +943,7 @@ class MultilabelCSSVM_WSS:
         self.verbose = verbose
         self.adaptive_ws = adaptive_ws
         self.patience = patience
+        self.max_cache_size_mb = max_cache_size_mb
 
         # Адаптивное вычисление C_pos
         neg_counts = total_samples - class_counts
@@ -840,7 +978,8 @@ class MultilabelCSSVM_WSS:
                 shrinking=True,
                 verbose=self.verbose,
                 adaptive_ws=self.adaptive_ws,
-                patience=self.patience
+                patience=self.patience,
+                max_cache_size_mb=self.max_cache_size_mb
             )
 
             clf.fit(X, y_binary)
@@ -944,6 +1083,38 @@ class MultilabelCSSVM_WSS:
 #         return self.decision_function(X)
 
 
+def load_encoder(model_path):
+    """
+    Загружает encoder модель и tokenizer.
+    Обрабатывает LoRA модели и обычные модели.
+    """
+    try:
+        # Пытаемся загрузить как LoRA модель
+        config = PeftConfig.from_pretrained(model_path)
+        base_model = AutoModelForSequenceClassification.from_pretrained(
+            config.base_model_name_or_path,
+            num_labels=28,  # ru_go_emotions classes
+            output_hidden_states=True,
+            ignore_mismatched_sizes=True
+        )
+        model = PeftModel.from_pretrained(base_model, model_path)
+        tokenizer = AutoTokenizer.from_pretrained(config.base_model_name_or_path)
+        print(f"Loaded LoRA model: {model_path}")
+    except Exception as e:
+        # Загружаем как обычную модель
+        try:
+            model = AutoModel.from_pretrained(model_path)
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            print(f"Loaded AutoModel: {model_path}")
+        except Exception as e2:
+            print(f"Error loading model: {e}, {e2}")
+            raise
+    
+    model.to(CONFIG['device'])
+    model.eval()
+    return model, tokenizer
+
+
 def get_embeddings(model_key, model_path, dataset, mlb):
     safe_name = model_key.replace("/", "_")
     cache_path = os.path.join(CONFIG["cache_dir"], f"{safe_name}.pt")
@@ -991,12 +1162,12 @@ def get_embeddings(model_key, model_path, dataset, mlb):
     torch.cuda.empty_cache()
     return X_train, y_train, X_test, y_test
 
-def train_sklearn_baselines(X_train, y_train, X_test, y_test, target_names_str, encoder_name, scaler=None):
+def train_sklearn_baselines(X_train, y_train, X_test, y_test, target_names_str, encoder_name):
     """
     Обучает sklearn baseline классификаторы.
 
-    Args:
-        scaler: Предобученный StandardScaler. Если None и use_scaler=True, создаётся новый.
+    ВАЖНО: X_train и X_test должны быть уже отмасштабированы (если use_scaler=True),
+    чтобы все эксперименты шли на равных условиях с CS-SVM.
     """
     print(f"\n--- Training sklearn baselines for {encoder_name} ---")
     X_train_np = X_train.numpy() if isinstance(X_train, torch.Tensor) else X_train
@@ -1004,18 +1175,9 @@ def train_sklearn_baselines(X_train, y_train, X_test, y_test, target_names_str, 
     y_train_np = y_train.numpy() if isinstance(y_train, torch.Tensor) else y_train
     y_test_np = y_test.numpy() if isinstance(y_test, torch.Tensor) else y_test
 
-    if CONFIG["use_scaler"]:
-        if scaler is not None:
-            # Используем переданный scaler для обеспечения идентичных условий
-            X_train_scaled = scaler.transform(X_train_np)
-            X_test_scaled = scaler.transform(X_test_np)
-        else:
-            scaler = StandardScaler()
-            X_train_scaled = scaler.fit_transform(X_train_np)
-            X_test_scaled = scaler.transform(X_test_np)
-    else:
-        X_train_scaled = X_train_np
-        X_test_scaled = X_test_np
+    # Данные уже отмасштабированы в main(), используем как есть
+    X_train_scaled = X_train_np
+    X_test_scaled = X_test_np
 
     classifiers = []
 
@@ -1113,113 +1275,122 @@ def main():
         print(f"\n{'='*40}")
         print(f"Processing: {model_friendly_name}")
         print(f"{'='*40}")
-        X_train, y_train, X_test, y_test = get_embeddings(model_friendly_name, model_path, ds, mlb)
+        
+        try:
+            X_train, y_train, X_test, y_test = get_embeddings(model_friendly_name, model_path, ds, mlb)
 
-        # Конвертируем в numpy
-        X_train_np = X_train.numpy() if isinstance(X_train, torch.Tensor) else X_train
-        X_test_np = X_test.numpy() if isinstance(X_test, torch.Tensor) else X_test
-        y_train_np = y_train.numpy() if isinstance(y_train, torch.Tensor) else y_train
-        y_test_np = y_test.numpy() if isinstance(y_test, torch.Tensor) else y_test
+            # Конвертируем в numpy
+            X_train_np = X_train.numpy() if isinstance(X_train, torch.Tensor) else X_train
+            X_test_np = X_test.numpy() if isinstance(X_test, torch.Tensor) else X_test
+            y_train_np = y_train.numpy() if isinstance(y_train, torch.Tensor) else y_train
+            y_test_np = y_test.numpy() if isinstance(y_test, torch.Tensor) else y_test
 
-        # Применяем StandardScaler
-        scaler = None
-        if CONFIG["use_scaler"]:
-            scaler = StandardScaler()
-            X_train_scaled = scaler.fit_transform(X_train_np)
-            X_test_scaled = scaler.transform(X_test_np)
-        else:
-            X_train_scaled = X_train_np
-            X_test_scaled = X_test_np
+            # Применяем StandardScaler
+            scaler = None
+            if CONFIG["use_scaler"]:
+                scaler = StandardScaler()
+                X_train_scaled = scaler.fit_transform(X_train_np)
+                X_test_scaled = scaler.transform(X_test_np)
+            else:
+                X_train_scaled = X_train_np
+                X_test_scaled = X_test_np
 
-        with mlflow.start_run(run_name=f"CS_SVM_WSS_Optimized_on_{model_friendly_name}"):
-            # Логируем параметры CS-SVM по статье
-            mlflow.log_param("encoder_model", model_path)
-            mlflow.log_param("optimization_method", "Dual_WSS_Optimized_Vectorized_Cached")
-            mlflow.log_param("C_slack", CONFIG["C_slack"])
-            mlflow.log_param("C_pos_base", CONFIG["C_pos"])
-            mlflow.log_param("C_neg", CONFIG["C_neg"])
-            mlflow.log_param("kappa", kappa)
-            mlflow.log_param("use_scaler", CONFIG["use_scaler"])
-            mlflow.log_param("adaptive_ws", True)
-            mlflow.log_param("patience", 10)
+            with mlflow.start_run(run_name=f"CS_SVM_WSS_Optimized_on_{model_friendly_name}"):
+                # Логируем параметры CS-SVM по статье
+                mlflow.log_param("encoder_model", model_path)
+                mlflow.log_param("optimization_method", "Dual_WSS_Optimized_Vectorized_Cached")
+                mlflow.log_param("C_slack", CONFIG["C_slack"])
+                mlflow.log_param("C_pos_base", CONFIG["C_pos"])
+                mlflow.log_param("C_neg", CONFIG["C_neg"])
+                mlflow.log_param("kappa", kappa)
+                mlflow.log_param("use_scaler", CONFIG["use_scaler"])
+                mlflow.log_param("adaptive_ws", True)
+                mlflow.log_param("patience", 10)
 
-            # Подсчёт примеров каждого класса для адаптивных весов
-            class_counts = y_train_np.sum(axis=0)
-            total_samples = len(y_train_np)
+                # Подсчёт примеров каждого класса для адаптивных весов
+                class_counts = y_train_np.sum(axis=0)
+                total_samples = len(y_train_np)
 
-            print("Training CS-SVM via Dual WSS (Working Set Selection)...")
-            print(f"  Dataset size: {total_samples} samples, {len(label_list)} classes")
+                print("Training CS-SVM via Dual WSS (Working Set Selection)...")
+                print(f"  Dataset size: {total_samples} samples, {len(label_list)} classes")
 
-            # Создаём и обучаем CS-SVM через WSS (Working Set Selection) с оптимизациями
-            svm = MultilabelCSSVM_WSS(
-                num_classes=len(label_list),
-                class_counts=class_counts,
-                total_samples=total_samples,
-                C_slack=CONFIG['C_slack'],
-                C_pos_base=CONFIG['C_pos'],
-                C_neg_base=CONFIG['C_neg'],
-                working_set_size=200,  # Начальный размер (будет адаптироваться)
-                max_iter=1000,
-                verbose=True,
-                adaptive_ws=True,  # Адаптивный размер working set
-                patience=10  # Early stopping patience
-            )
+                # Создаём и обучаем CS-SVM через WSS (Working Set Selection) с оптимизациями
+                svm = MultilabelCSSVM_WSS(
+                    num_classes=len(label_list),
+                    class_counts=class_counts,
+                    total_samples=total_samples,
+                    C_slack=CONFIG['C_slack'],
+                    C_pos_base=CONFIG['C_pos'],
+                    C_neg_base=CONFIG['C_neg'],
+                    working_set_size=200,  # Начальный размер (будет адаптироваться)
+                    max_iter=1000,
+                    verbose=True,
+                    adaptive_ws=True,  # Адаптивный размер working set
+                    patience=10,  # Early stopping patience
+                    max_cache_size_mb=100  # Максимальный размер кэша
+                )
 
-            svm.fit(X_train_scaled, y_train_np)
+                svm.fit(X_train_scaled, y_train_np)
 
-            print("Evaluating CS-SVM...")
-            # Предсказания
-            y_scores = svm.decision_function(X_test_scaled)
-            pred_bin = svm.predict(X_test_scaled)
+                print("Evaluating CS-SVM...")
+                # Предсказания
+                y_scores = svm.decision_function(X_test_scaled)
+                pred_bin = svm.predict(X_test_scaled)
 
-            # Метрики
-            metrics = {
-                "f1_micro": f1_score(y_test_np, pred_bin, average='micro'),
-                "f1_macro": f1_score(y_test_np, pred_bin, average='macro'),
-                "f1_weighted": f1_score(y_test_np, pred_bin, average='weighted'),
-                "accuracy": accuracy_score(y_test_np, pred_bin)
-            }
-            metrics_at_k = compute_all_metrics_at_k(y_test_np, y_scores, k_values=CONFIG["k_values"])
-            metrics.update(metrics_at_k)
+                # Метрики
+                metrics = {
+                    "f1_micro": f1_score(y_test_np, pred_bin, average='micro'),
+                    "f1_macro": f1_score(y_test_np, pred_bin, average='macro'),
+                    "f1_weighted": f1_score(y_test_np, pred_bin, average='weighted'),
+                    "accuracy": accuracy_score(y_test_np, pred_bin)
+                }
+                metrics_at_k = compute_all_metrics_at_k(y_test_np, y_scores, k_values=CONFIG["k_values"])
+                metrics.update(metrics_at_k)
 
-            print(f"CS-SVM WSS Results for {model_friendly_name}:")
-            print(f"  F1_micro={metrics['f1_micro']:.4f}, F1_macro={metrics['f1_macro']:.4f}")
-            print(f"  Precision@5={metrics.get('precision_at_5', 0):.4f}, MAP@5={metrics.get('map_at_5', 0):.4f}")
-            print(f"  NDCG@5={metrics.get('ndcg_at_5', 0):.4f}, Hit_Rate@5={metrics.get('hit_rate_at_5', 0):.4f}")
+                print(f"CS-SVM WSS Results for {model_friendly_name}:")
+                print(f"  F1_micro={metrics['f1_micro']:.4f}, F1_macro={metrics['f1_macro']:.4f}")
+                print(f"  Precision@5={metrics.get('precision_at_5', 0):.4f}, MAP@5={metrics.get('map_at_5', 0):.4f}")
+                print(f"  NDCG@5={metrics.get('ndcg_at_5', 0):.4f}, Hit_Rate@5={metrics.get('hit_rate_at_5', 0):.4f}")
 
-            mlflow.log_metrics(metrics)
+                mlflow.log_metrics(metrics)
 
-            # Сохраняем веса модели
-            np.savez("svm_model_qp.npz", w=svm.w, b=svm.b)
-            mlflow.log_artifact("svm_model_qp.npz")
+                # Сохраняем веса модели
+                np.savez("svm_model_qp.npz", w=svm.w, b=svm.b)
+                mlflow.log_artifact("svm_model_qp.npz")
 
-            # Сохраняем отчёт классификации
-            report = classification_report(y_test_np, pred_bin, target_names=target_names_str, zero_division=0)
-            with open("classification_report.txt", "w", encoding="utf-8") as f:
-                f.write(f"Encoder: {model_friendly_name}\n")
-                f.write("Optimization: Dual WSS Optimized (Vectorized + Cached + Adaptive)\n")
-                f.write(f"Paper: Cost-sensitive Support Vector Machines (arXiv:1212.0975v2)\n\n")
-                f.write(f"Parameters:\n")
-                f.write(f"  C_slack = {CONFIG['C_slack']}\n")
-                f.write(f"  C_neg = {CONFIG['C_neg']}\n")
-                f.write(f"  κ = {kappa:.4f}\n")
-                f.write(f"  adaptive_ws = True\n")
-                f.write(f"  patience = 10\n\n")
-                f.write(report)
-            mlflow.log_artifact("classification_report.txt")
+                # Сохраняем отчёт классификации
+                report = classification_report(y_test_np, pred_bin, target_names=target_names_str, zero_division=0)
+                with open("classification_report.txt", "w", encoding="utf-8") as f:
+                    f.write(f"Encoder: {model_friendly_name}\n")
+                    f.write("Optimization: Dual WSS Optimized (Vectorized + Cached + Adaptive)\n")
+                    f.write(f"Paper: Cost-sensitive Support Vector Machines (arXiv:1212.0975v2)\n\n")
+                    f.write(f"Parameters:\n")
+                    f.write(f"  C_slack = {CONFIG['C_slack']}\n")
+                    f.write(f"  C_neg = {CONFIG['C_neg']}\n")
+                    f.write(f"  κ = {kappa:.4f}\n")
+                    f.write(f"  adaptive_ws = True\n")
+                    f.write(f"  patience = 10\n\n")
+                    f.write(report)
+                mlflow.log_artifact("classification_report.txt")
 
-            all_results[f"CS_SVM_WSS_{model_friendly_name}"] = metrics
-            print(f"CS-SVM WSS run for {model_friendly_name} completed.")
+                all_results[f"CS_SVM_WSS_{model_friendly_name}"] = metrics
+                print(f"CS-SVM WSS run for {model_friendly_name} completed.")
 
-        if CONFIG["run_sklearn_baseline"]:
-            # Передаём тот же scaler для обеспечения идентичных условий
-            sklearn_results = train_sklearn_baselines(
-                X_train, y_train, X_test, y_test,
-                target_names_str, model_friendly_name,
-                scaler=scaler if CONFIG["use_scaler"] else None
-            )
-            for clf_name, m in sklearn_results.items():
-                all_results[f"{clf_name}_{model_friendly_name}"] = m
+            if CONFIG["run_sklearn_baseline"]:
+                # ВАЖНО: Передаём УЖЕ отмасштабированные данные (X_train_scaled, X_test_scaled)
+                # чтобы все эксперименты шли на равных условиях
+                sklearn_results = train_sklearn_baselines(
+                    X_train_scaled, y_train, X_test_scaled, y_test,
+                    target_names_str, model_friendly_name
+                )
+                for clf_name, m in sklearn_results.items():
+                    all_results[f"{clf_name}_{model_friendly_name}"] = m
+
+        except Exception as e:
+            print(f"Error processing {model_friendly_name}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
 
     print("\n" + "="*80)
     print("SUMMARY - All Results")
