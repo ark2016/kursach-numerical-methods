@@ -45,7 +45,10 @@ CONFIG = {
     # Baseline sklearn SVM
     "run_sklearn_baseline": False,  # Отключено - уже протестировано
     "sklearn_svm_C_values": [0.1, 1.0],  # Разные значения C для LinearSVC
-    "use_scaler": True,  # StandardScaler перед sklearn SVM
+    # ВАЖНО: Эмбеддинги уже нормализованы (L2 norm) на строке 1148!
+    # StandardScaler поверх нормализованных эмбеддингов может навредить вычислению bias.
+    # Попробуйте сначала с False, если получаете все F1=0.
+    "use_scaler": False,  # StandardScaler перед SVM (было True - вызывало проблемы!)
 
     # Metrics @k settings
     "k_values": [1, 3, 5, 10],
@@ -875,43 +878,46 @@ class BinaryCSSVM_WSS:
         return violations
 
     def _compute_bias(self, X, y, alphas, C_upper):
-        """Вычисляет bias используя free support vectors."""
-        b_values = []
+        """
+        Вычисляет bias используя free support vectors.
+
+        Упрощенная версия с явным циклом (более надежная чем векторизация с np.nan).
+        Для free SV: y_i * (w^T x_i + b) = 1
+        => b = y_i - w^T x_i  (если y_i = +1)
+        => b = -κ - w^T x_i   (если y_i = -1, так как w^T x_i + b = -κ)
+        """
+        b_estimates = []
         eps = 1e-5
 
+        # Сначала пробуем free support vectors
         free_sv_mask = (alphas > eps) & (alphas < C_upper - eps)
         free_sv_indices = np.where(free_sv_mask)[0]
 
         if len(free_sv_indices) > 0:
-            # Векторизованное вычисление
-            wx = X[free_sv_indices] @ self.w
-            y_free = y[free_sv_indices]
+            for i in free_sv_indices:
+                wx = np.dot(self.w, X[i])
+                if y[i] > 0:
+                    b_estimates.append(1.0 - wx)
+                else:  # y[i] < 0
+                    b_estimates.append(-self.kappa - wx)
 
-            # Для положительных примеров: b = 1 - wx
-            # Для отрицательных: b = -κ - wx
-            b_pos = np.where(y_free > 0, 1.0 - wx, np.nan)
-            b_neg = np.where(y_free < 0, -self.kappa - wx, np.nan)
+            return np.mean(b_estimates)
 
-            b_values = np.concatenate([b_pos[~np.isnan(b_pos)],
-                                      b_neg[~np.isnan(b_neg)]])
+        # Fallback: используем все support vectors (boundary SVs)
+        sv_indices = np.where(alphas > eps)[0]
+        if len(sv_indices) == 0:
+            if self.verbose:
+                warnings.warn("No support vectors found! Bias set to 0.0")
+            return 0.0
 
-            return np.mean(b_values) if len(b_values) > 0 else 0.0
-        else:
-            # Fallback: используем все SV
-            sv_indices = np.where(alphas > eps)[0]
-            if len(sv_indices) == 0:
-                return 0.0
+        for i in sv_indices:
+            wx = np.dot(self.w, X[i])
+            if y[i] > 0:
+                b_estimates.append(1.0 - wx)
+            else:  # y[i] < 0
+                b_estimates.append(-self.kappa - wx)
 
-            wx = X[sv_indices] @ self.w
-            y_sv = y[sv_indices]
-
-            b_pos = np.where(y_sv > 0, 1.0 - wx, np.nan)
-            b_neg = np.where(y_sv < 0, -self.kappa - wx, np.nan)
-
-            b_values = np.concatenate([b_pos[~np.isnan(b_pos)],
-                                      b_neg[~np.isnan(b_neg)]])
-
-            return np.mean(b_values) if len(b_values) > 0 else 0.0
+        return np.mean(b_estimates) if len(b_estimates) > 0 else 0.0
     
     def decision_function(self, X):
         """Вычисление решающей функции f(x) = w^T x + b"""
@@ -974,7 +980,7 @@ class MultilabelCSSVM_WSS:
                 C_neg=self.C_neg_base,
                 working_set_size=self.working_set_size,
                 max_iter=self.max_iter,
-                tol=1e-3,
+                tol=5e-3,  # Ослаблено с 1e-3 для более быстрой и надежной сходимости
                 shrinking=True,
                 verbose=self.verbose,
                 adaptive_ws=self.adaptive_ws,
@@ -987,6 +993,13 @@ class MultilabelCSSVM_WSS:
 
             self.w[:, c] = clf.w
             self.b[c] = clf.b
+
+            # ДИАГНОСТИКА: логируем параметры каждого класса
+            if self.verbose:
+                n_pos = np.sum(y_binary > 0)
+                n_neg = np.sum(y_binary < 0)
+                w_norm = np.linalg.norm(clf.w)
+                print(f"  Class {c}: pos={n_pos}, neg={n_neg}, b={clf.b:.6f}, ||w||={w_norm:.6f}, n_sv={len(clf.alphas)}")
 
         return self
     
@@ -1315,6 +1328,10 @@ def main():
                 print(f"  Dataset size: {total_samples} samples, {len(label_list)} classes")
 
                 # Создаём и обучаем CS-SVM через WSS (Working Set Selection) с оптимизациями
+                # ПАРАМЕТРЫ ДЛЯ ОТЛАДКИ:
+                # - Если F1=0: попробуйте max_iter=2000-5000, tol=1e-2
+                # - Если не сходится: попробуйте отключить shrinking=False, adaptive_ws=False
+                # - Увеличьте patience=20 для более тщательной оптимизации
                 svm = MultilabelCSSVM_WSS(
                     num_classes=len(label_list),
                     class_counts=class_counts,
@@ -1323,10 +1340,10 @@ def main():
                     C_pos_base=CONFIG['C_pos'],
                     C_neg_base=CONFIG['C_neg'],
                     working_set_size=200,  # Начальный размер (будет адаптироваться)
-                    max_iter=1000,
+                    max_iter=2000,  # Увеличено с 1000 для лучшей сходимости
                     verbose=True,
                     adaptive_ws=True,  # Адаптивный размер working set
-                    patience=10,  # Early stopping patience
+                    patience=15,  # Увеличено с 10 для более тщательной оптимизации
                     max_cache_size_mb=100  # Максимальный размер кэша
                 )
 
@@ -1336,6 +1353,17 @@ def main():
                 # Предсказания
                 y_scores = svm.decision_function(X_test_scaled)
                 pred_bin = svm.predict(X_test_scaled)
+
+                # ДИАГНОСТИКА: Проверяем распределение скоров
+                print(f"  Decision function distribution:")
+                print(f"    Min: {np.min(y_scores):.6f}, Max: {np.max(y_scores):.6f}")
+                print(f"    Mean: {np.mean(y_scores):.6f}, Std: {np.std(y_scores):.6f}")
+                print(f"    Median: {np.median(y_scores):.6f}")
+                print(f"    % of positive scores: {100 * np.mean(y_scores > 0):.2f}%")
+                print(f"  Bias (b) distribution:")
+                print(f"    Min: {np.min(svm.b):.6f}, Max: {np.max(svm.b):.6f}")
+                print(f"    Mean: {np.mean(svm.b):.6f}, Median: {np.median(svm.b):.6f}")
+                print(f"  Predicted labels sum: {pred_bin.sum():.0f} (out of {pred_bin.size} total predictions)")
 
                 # Метрики
                 metrics = {
