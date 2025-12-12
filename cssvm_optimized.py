@@ -87,10 +87,22 @@ class OptimizedCSSVM:
         # Конвертируем метки в {-1, +1}
         y = np.where(y > 0, 1, -1).astype(np.float64)
         
+        # ИСПРАВЛЕНО: Нормализация данных для численной стабильности
+        # Это предотвращает слишком большие значения весов
+        X_mean = np.mean(X, axis=0)
+        X_std = np.std(X, axis=0)
+        X_std[X_std < 1e-8] = 1.0  # Предотвращаем деление на ноль
+        X_normalized = (X - X_mean) / X_std
+        
+        # Сохраняем параметры нормализации для предсказаний
+        self._X_mean = X_mean
+        self._X_std = X_std
+        self._is_normalized = True
+        
         if self.use_wss:
-            return self._fit_wss(X, y)
+            return self._fit_wss(X_normalized, y)
         else:
-            return self._fit_qp(X, y)
+            return self._fit_qp(X_normalized, y)
 
     def _fit_qp(self, X, y):
         """
@@ -397,11 +409,17 @@ class OptimizedCSSVM:
     def _update_gradients(self, X, y, delta_alpha, B, active_set, gradients):
         """
         Эффективное обновление градиентов.
+        ИСПРАВЛЕНО: Учитываем только ненулевые изменения delta_alpha
         """
         # Вычисляем изменение: gradients[active] -= X[active] @ X[B].T @ (delta_alpha * y[B]) * y[active]
-        temp = X[B].T @ (delta_alpha * y[B])  # (n_features,)
-        kernel_delta = X[active_set] @ temp  # (n_active,)
-        gradients[active_set] -= kernel_delta * y[active_set]
+        # ИСПРАВЛЕНО: Фильтруем только ненулевые delta_alpha для эффективности
+        non_zero_mask = np.abs(delta_alpha) > 1e-10
+        if np.any(non_zero_mask):
+            B_nonzero = B[non_zero_mask]
+            delta_alpha_nonzero = delta_alpha[non_zero_mask]
+            temp = X[B_nonzero].T @ (delta_alpha_nonzero * y[B_nonzero])  # (n_features,)
+            kernel_delta = X[active_set] @ temp  # (n_active,)
+            gradients[active_set] -= kernel_delta * y[active_set]
 
     def _compute_max_violation(self, alphas, gradients, y, C_upper):
         """
@@ -476,7 +494,12 @@ class OptimizedCSSVM:
 
     def decision_function(self, X):
         """Вычисление значения решающей функции f(x) = w^T x + b"""
-        return np.dot(X, self.w) + self.b
+        if self._is_normalized and hasattr(self, '_X_mean') and hasattr(self, '_X_std'):
+            # Применяем ту же нормализацию, что и при обучении
+            X_normalized = (X - self._X_mean) / self._X_std
+            return np.dot(X_normalized, self.w) + self.b
+        else:
+            return np.dot(X, self.w) + self.b
 
     def predict(self, X):
         """Предсказание класса: sign(f(x))"""
