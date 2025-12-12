@@ -232,18 +232,32 @@ class OptimizedCSSVM:
         q_vec = np.where(y > 0, 1.0, self.kappa)
         gradients = q_vec.copy()
         
-        # Active set
+        # Active set - начинаем со всех образцов
         active_set = np.arange(n_samples)
         
         # Статистика
         self._cache_hits = 0
         self._cache_misses = 0
         
+        # Добавляем раннюю остановку
+        best_violation = float('inf')
+        patience_counter = 0
+        
         iterator = tqdm(range(self.max_iter), desc="WSS Optimization") if self.verbose else range(self.max_iter)
         
         for iteration in iterator:
-            # Выбираем working set
+            # Выбираем working set - гарантируем, что есть образцы обоих классов
             B = self._select_working_set(alphas, gradients, y, C_upper, active_set)
+            
+            # ИСПРАВЛЕНО: Гарантируем, что в working set есть оба класса
+            if len(B) > 0:
+                y_B = y[B]
+                if len(np.unique(y_B)) < 2:
+                    # Добавляем образцы другого класса, если нужно
+                    missing_class = 1 if np.sum(y_B > 0) == 0 else -1
+                    missing_indices = np.where((y[active_set] == missing_class) & (alphas[active_set] < C_upper[active_set]))[0]
+                    if len(missing_indices) > 0:
+                        B = np.concatenate([B, active_set[missing_indices[:1]]])
             
             if len(B) == 0:
                 if self.verbose:
@@ -262,12 +276,25 @@ class OptimizedCSSVM:
             # Проверка сходимости
             max_violation = self._compute_max_violation(alphas[active_set], gradients[active_set], y[active_set], C_upper[active_set])
             
-            if self.verbose and iteration % 100 == 0:
-                print(f"Iter {iteration}: violation={max_violation:.6f}, |B|={len(B)}")
+            # ИСПРАВЛЕНО: Логируем каждую итерацию для отладки
+            if self.verbose and iteration % 10 == 0:
+                print(f"Iter {iteration}: violation={max_violation:.6f}, |B|={len(B)}, alpha_sum={np.sum(alphas):.2f}")
+            
+            # ИСПРАВЛЕНО: Ранняя остановка с терпением
+            if max_violation < best_violation:
+                best_violation = max_violation
+                patience_counter = 0
+            else:
+                patience_counter += 1
             
             if max_violation < self.tol:
                 if self.verbose:
                     print(f"Converged at iteration {iteration}")
+                break
+            
+            if patience_counter >= 10 and max_violation < 0.1:
+                if self.verbose:
+                    print(f"Early stopping at iteration {iteration} (violation={max_violation:.6f})")
                 break
         
         # Финализация решения
@@ -276,6 +303,7 @@ class OptimizedCSSVM:
         if self.verbose:
             print(f"Training complete:")
             print(f"  Support vectors: {len(self.alphas)} / {n_samples}")
+            print(f"  Alpha sum: {np.sum(alphas):.2f}")
             print(f"  Cache statistics: hits={self._cache_hits}, misses={self._cache_misses}")
         
         return self
@@ -283,6 +311,7 @@ class OptimizedCSSVM:
     def _select_working_set(self, alphas, gradients, y, C_upper, candidate_set, q=None):
         """
         Выбор working set с учётом KKT условий.
+        Гарантирует наличие образцов обоих классов.
         """
         if q is None:
             q = self.q
@@ -307,6 +336,18 @@ class OptimizedCSSVM:
         # Сортируем по нарушениям
         sorted_indices = np.argsort(-violations)
         selected = candidates[sorted_indices[:q]]
+        
+        # ИСПРАВЛЕНО: Гарантируем наличие обоих классов
+        y_selected = y[selected]
+        if len(np.unique(y_selected)) < 2:
+            # Находим образцы отсутствующего класса
+            missing_class = 1 if np.sum(y_selected > 0) == 0 else -1
+            missing_candidates = candidates[y[candidates] == missing_class]
+            if len(missing_candidates) > 0:
+                # Добавляем лучший кандидат из отсутствующего класса
+                missing_violations = violations[y[candidates] == missing_class]
+                best_missing_idx = np.argmax(missing_violations)
+                selected = np.concatenate([selected, [missing_candidates[best_missing_idx]]])
         
         return selected
 
