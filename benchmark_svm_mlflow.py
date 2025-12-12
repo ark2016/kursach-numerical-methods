@@ -583,13 +583,8 @@ class BinaryCSSVM_WSS:
         if q == 0:
             return alphas[B]
         
-        # Проверка: если только одна переменная, упрощаем
-        if q == 1:
-            i = B[0]
-            # Аналитическое решение для одной переменной
-            alpha_new = alphas[i] - gradients[i] / (X[i] @ X[i] + 1e-8)
-            alpha_new = np.clip(alpha_new, 0, C_upper[i])
-            return np.array([alpha_new])
+        # Для q=1 тоже используем полное QP решение, т.к. аналитическое
+        # решение не учитывает equality constraint корректно
         
         # Проверяем кэш для kernel matrix
         B_tuple = tuple(sorted(B))
@@ -620,16 +615,31 @@ class BinaryCSSVM_WSS:
             self._cache_misses += 1
 
         y_B = y[B]
-        Q = (y_B.reshape(-1, 1) * y_B) * K_BB
-        
-        # Улучшенная регуляризация для численной стабильности
-        # Adaptive epsilon на основе condition number
-        min_eig = np.min(np.linalg.eigvalsh(Q))
-        reg_eps = max(1e-8, -min_eig + 1e-6) if min_eig < 0 else 1e-8
-        Q = Q + reg_eps * np.eye(q)
+        Q_BB = (y_B.reshape(-1, 1) * y_B) * K_BB
 
-        p = -gradients[B]
-        
+        # Улучшенная регуляризация для численной стабильности
+        min_eig = np.min(np.linalg.eigvalsh(Q_BB))
+        reg_eps = max(1e-8, -min_eig + 1e-6) if min_eig < 0 else 1e-8
+        Q_BB_reg = Q_BB + reg_eps * np.eye(q)
+
+        # ИСПРАВЛЕНО: Правильный линейный коэффициент для QP подзадачи
+        # При фиксированном alpha_notB, минимизируем:
+        # f(alpha_B) = 1/2 alpha_B^T Q_BB alpha_B + (Q_{B,notB} @ alpha_notB - q_B)^T alpha_B
+        #
+        # gradient_i = q_i - sum_j(alpha_j * y_j * K_ij * y_i)
+        # => sum_j(alpha_j * Q_ij) = y_i * (q_i - gradient_i)
+        # => Q @ alpha = y * (q - gradient)
+        #
+        # Линейный коэффициент: p = Q_{B,notB} @ alpha_notB - q_B
+        #                        = (Q @ alpha)[B] - Q_BB @ alpha_B - q_B
+
+        # Вычисляем Q @ alpha через gradient: (Q @ alpha)_i = y_i * (q_i - gradient_i)
+        q_B = np.where(y_B > 0, 1.0, self.kappa)
+        Q_alpha_B = y_B * (q_B - gradients[B])  # (Q @ alpha)[B]
+
+        # Линейный коэффициент для подзадачи
+        p = Q_alpha_B - Q_BB @ alphas[B] - q_B
+
         # ВАЖНО: правильное вычисление c для equality constraint
         # Constraint: sum(alpha[B] * y[B]) = -sum(alpha[not B] * y[not B])
         all_indices = np.arange(len(alphas))
@@ -640,12 +650,21 @@ class BinaryCSSVM_WSS:
         u_box = C_upper[B]
 
         # OSQP setup с улучшенными настройками
+        # ИСПРАВЛЕНО: A должна включать equality constraint И box constraints!
+        # Формулировка OSQP: l <= A*x <= u
+        # A = [y_B^T]  - equality constraint (1 row)
+        #     [I_q]    - identity для box constraints (q rows)
         try:
-            P_sparse = sparse.csc_matrix(Q)
-            A_sparse = sparse.csc_matrix(y_B.reshape(1, -1))
-            
-            l_constraints = np.concatenate([[c], l_box])
-            u_constraints = np.concatenate([[c], u_box])
+            P_sparse = sparse.csc_matrix(Q_BB_reg)
+
+            # Строим матрицу A: сначала equality constraint, потом identity для box
+            A_eq = sparse.csc_matrix(y_B.reshape(1, -1))  # (1, q)
+            A_box = sparse.eye(q, format='csc')            # (q, q)
+            A_sparse = sparse.vstack([A_eq, A_box], format='csc')  # (1+q, q)
+
+            # Границы: [c] для equality, [0, C_upper] для box
+            l_constraints = np.concatenate([[c], l_box])   # (1+q,)
+            u_constraints = np.concatenate([[c], u_box])   # (1+q,)
             
             m = osqp.OSQP()
             m.setup(
@@ -668,12 +687,18 @@ class BinaryCSSVM_WSS:
                 return alphas[B]  # Возвращаем старые значения
             
             alpha_B_new = np.clip(results.x, 0, C_upper[B])
-            
+
+            # Проверка на NaN/inf
+            if not np.all(np.isfinite(alpha_B_new)):
+                if self.verbose:
+                    warnings.warn(f"OSQP returned NaN/inf, returning old alphas")
+                return alphas[B]
+
             # Проверка: насколько изменились alphas
             change = np.linalg.norm(alpha_B_new - alphas[B])
             if change < 1e-10:
                 return alphas[B]  # Не обновляем если изменения минимальны
-            
+
             return alpha_B_new
             
         except Exception as e:
