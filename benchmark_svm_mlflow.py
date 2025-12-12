@@ -545,6 +545,12 @@ class BinaryCSSVM_WSS:
 
         ВАЖНО: Гарантируем наличие примеров обоих классов в working set,
         иначе equality constraint sum(alpha*y)=0 вынудит alpha=0!
+
+        KKT условия для dual (min 1/2 α^T Q α - q^T α):
+        - Градиент dual: ∇f = Qα - q = -gradients (код хранит gradients = q - Qα)
+        - При α=0: хотим увеличить α если ∇f < 0, т.е. gradients > 0
+        - При α=C: хотим уменьшить α если ∇f > 0, т.е. gradients < 0
+        - Free: ∇f = 0, т.е. gradients = 0
         """
         if len(candidate_set) == 0:
             return np.array([], dtype=int)
@@ -558,18 +564,20 @@ class BinaryCSSVM_WSS:
         y_c = y[candidates]
         C_c = C_upper[candidates]
 
-        yg = y_c * grad_c
-
         # Маски для трёх случаев
         at_lower = alpha_c < eps
         at_upper = alpha_c > C_c - eps
         free = ~at_lower & ~at_upper
 
-        # Вычисляем нарушения
+        # ИСПРАВЛЕНО: Правильные KKT нарушения для dual задачи
+        # gradients = q - Qα, поэтому ∇f = -gradients
+        # При α=0: нарушение если ∇f < 0, т.е. -gradients < 0, т.е. gradients > 0
+        # При α=C: нарушение если ∇f > 0, т.е. -gradients > 0, т.е. gradients < 0
+        # Free: нарушение если ∇f ≠ 0, т.е. gradients ≠ 0
         violations = np.zeros(len(candidates))
-        violations[at_lower] = np.maximum(0, 1.0 - yg[at_lower])
-        violations[at_upper] = np.maximum(0, yg[at_upper] - 1.0)
-        violations[free] = np.abs(yg[free] - 1.0)
+        violations[at_lower] = np.maximum(0, grad_c[at_lower])  # Хотим grad <= 0
+        violations[at_upper] = np.maximum(0, -grad_c[at_upper])  # Хотим grad >= 0
+        violations[free] = np.abs(grad_c[free])  # Хотим grad = 0
 
         # ИСПРАВЛЕНИЕ: Выбираем working set с балансом классов
         # Разделяем кандидатов на положительные и отрицательные
@@ -718,12 +726,21 @@ class BinaryCSSVM_WSS:
             )
             
             results = m.solve()
-            
+
+            # ДИАГНОСТИКА: выводим информацию о решении
+            if self.verbose and np.random.random() < 0.01:  # 1% выборка
+                print(f"\n  OSQP debug: status={results.info.status}, "
+                      f"p_range=[{p.min():.4f}, {p.max():.4f}], "
+                      f"alpha_old_sum={alphas[B].sum():.6f}")
+                if results.x is not None:
+                    print(f"    alpha_new: min={results.x.min():.6f}, max={results.x.max():.6f}, "
+                          f"sum={results.x.sum():.6f}")
+
             if results.info.status != 'solved' and results.info.status != 'solved_inaccurate':
                 if self.verbose:
                     warnings.warn(f"OSQP status: {results.info.status} for |B|={q}")
                 return alphas[B]  # Возвращаем старые значения
-            
+
             alpha_B_new = np.clip(results.x, 0, C_upper[B])
 
             # Проверка на NaN/inf
@@ -767,23 +784,30 @@ class BinaryCSSVM_WSS:
         return active_indices if len(active_indices) > 0 else np.arange(len(alphas))
     
     def _compute_max_violation_vectorized(self, alphas, gradients, y, C_upper):
-        """Векторизованное вычисление максимального нарушения KKT."""
+        """
+        Векторизованное вычисление максимального нарушения KKT.
+
+        KKT для dual (min 1/2 α^T Q α - q^T α):
+        - gradients = q - Qα, т.е. ∇f = -gradients
+        - При α=0: ∇f >= 0 (нарушение если gradients > 0)
+        - При α=C: ∇f <= 0 (нарушение если gradients < 0)
+        - Free: ∇f = 0 (нарушение если gradients ≠ 0)
+        """
         if len(alphas) == 0:
             return 0.0
 
         eps = 1e-8
-        yg = y * gradients
 
         # Маски
         at_lower = alphas < eps
         at_upper = alphas > C_upper - eps
         free = ~at_lower & ~at_upper
 
-        # Нарушения
+        # ИСПРАВЛЕНО: Правильные KKT нарушения для dual
         violations = np.zeros(len(alphas))
-        violations[at_lower] = np.maximum(0, 1.0 - yg[at_lower])
-        violations[at_upper] = np.maximum(0, yg[at_upper] - 1.0)
-        violations[free] = np.abs(yg[free] - 1.0)
+        violations[at_lower] = np.maximum(0, gradients[at_lower])  # Хотим grad <= 0
+        violations[at_upper] = np.maximum(0, -gradients[at_upper])  # Хотим grad >= 0
+        violations[free] = np.abs(gradients[free])  # Хотим grad = 0
 
         return np.max(violations)
 
@@ -919,25 +943,28 @@ class BinaryCSSVM_WSS:
                   f"mean={np.mean(train_violations):.6f}")
 
     def _compute_kkt_violations(self, X, y, alphas, C_upper):
-        """Вычисляет нарушения KKT для диагностики."""
+        """
+        Вычисляет нарушения KKT для диагностики.
+
+        KKT для dual: gradients = q - Qα, ∇f = -gradients
+        """
         eps = 1e-8
-        
+
         # Вычисляем градиенты
         q_vec = np.where(y > 0, 1.0, self.kappa)
         K_alpha_y = X @ (X.T @ (alphas * y))
         gradients = q_vec - K_alpha_y * y
-        
-        yg = y * gradients
-        
+
         violations = np.zeros(len(alphas))
         at_lower = alphas < eps
         at_upper = alphas > C_upper - eps
         free = ~at_lower & ~at_upper
-        
-        violations[at_lower] = np.maximum(0, 1.0 - yg[at_lower])
-        violations[at_upper] = np.maximum(0, yg[at_upper] - 1.0)
-        violations[free] = np.abs(yg[free] - 1.0)
-        
+
+        # Правильные KKT нарушения для dual
+        violations[at_lower] = np.maximum(0, gradients[at_lower])
+        violations[at_upper] = np.maximum(0, -gradients[at_upper])
+        violations[free] = np.abs(gradients[free])
+
         return violations
 
     def _compute_bias(self, X, y, alphas, C_upper):
