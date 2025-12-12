@@ -661,22 +661,22 @@ class BinaryCSSVM_WSS:
         Q_BB_reg = Q_BB + reg_eps * np.eye(q)
 
         # ИСПРАВЛЕНО: Правильный линейный коэффициент для QP подзадачи
-        # При фиксированном alpha_notB, минимизируем:
-        # f(alpha_B) = 1/2 alpha_B^T Q_BB alpha_B + (Q_{B,notB} @ alpha_notB - q_B)^T alpha_B
         #
-        # gradient_i = q_i - sum_j(alpha_j * y_j * K_ij * y_i)
-        # => sum_j(alpha_j * Q_ij) = y_i * (q_i - gradient_i)
-        # => Q @ alpha = y * (q - gradient)
+        # Двойственная задача: min_α 1/2 α^T Q α - q^T α
+        # где Q_ij = y_i y_j K_ij, q_i = 1 (y=+1) или κ (y=-1)
         #
-        # Линейный коэффициент: p = Q_{B,notB} @ alpha_notB - q_B
-        #                        = (Q @ alpha)[B] - Q_BB @ alpha_B - q_B
+        # Градиент: ∇f(α) = Q α - q
+        #
+        # Код хранит: gradients[i] = q_i - (Q @ α)_i
+        # Следовательно: (Q @ α)_i = q_i - gradients_i  (БЕЗ умножения на y!)
+        #
+        # Для подзадачи с фиксированным α_notB:
+        # p = Q_{B,notB} @ α_notB - q_B
+        #   = (Q @ α)_B - Q_BB @ α_B - q_B
+        #   = (q_B - gradients_B) - Q_BB @ α_B - q_B
+        #   = -gradients_B - Q_BB @ α_B
 
-        # Вычисляем Q @ alpha через gradient: (Q @ alpha)_i = y_i * (q_i - gradient_i)
-        q_B = np.where(y_B > 0, 1.0, self.kappa)
-        Q_alpha_B = y_B * (q_B - gradients[B])  # (Q @ alpha)[B]
-
-        # Линейный коэффициент для подзадачи
-        p = Q_alpha_B - Q_BB @ alphas[B] - q_B
+        p = -gradients[B] - Q_BB @ alphas[B]
 
         # ВАЖНО: правильное вычисление c для equality constraint
         # Constraint: sum(alpha[B] * y[B]) = -sum(alpha[not B] * y[not B])
@@ -1049,9 +1049,9 @@ class MultilabelCSSVM_WSS:
                 working_set_size=self.working_set_size,
                 max_iter=self.max_iter,
                 tol=5e-3,  # Ослаблено с 1e-3 для более быстрой и надежной сходимости
-                shrinking=True,
+                shrinking=False,  # Отключено для надежной сходимости
                 verbose=self.verbose,
-                adaptive_ws=self.adaptive_ws,
+                adaptive_ws=False,  # Отключено для стабильности
                 patience=self.patience,
                 max_cache_size_mb=self.max_cache_size_mb
             )
