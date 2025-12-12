@@ -81,99 +81,100 @@ os.environ["MLFLOW_S3_IGNORE_TLS"] = "true"
 # Создаем папку для кэша
 os.makedirs(CONFIG["cache_dir"], exist_ok=True)
 
-class BinaryCSSVM_Primal_Torch(torch.nn.Module):
-    """
-    Решает ПРЯМУЮ задачу CS-SVM (Equation 49 из статьи) через SGD/Adam на GPU.
-    """
-
-    def __init__(self, n_features, C_slack=1.0, C_pos=3.0, C_neg=2.0, 
-                 device="cuda", epochs=500, lr=0.01):
-        super().__init__()
-        self.device = device
-        self.epochs = epochs
-        self.lr = lr
-        
-        # Параметры из статьи
-        self.kappa = 1.0 / (2 * C_neg - 1)
-        
-        # Коэффициенты штрафа (Equation 49)
-        self.weight_pos = C_slack * C_pos
-        self.weight_neg = C_slack / self.kappa
-        
-        # Параметры модели (w и b)
-        # Инициализируем маленькими случайными числами
-        self.w = torch.nn.Parameter(torch.randn(n_features, 1, device=device) * 0.01)
-        self.b = torch.nn.Parameter(torch.zeros(1, device=device))
-
-    def forward(self, x):
-        return x @ self.w + self.b
-
-    def fit(self, X, y):
-        # Конвертация данных на GPU
-        # Если пришел numpy array, конвертируем в тензор
-        if not isinstance(X, torch.Tensor):
-            X = torch.tensor(X, dtype=torch.float32)
-        else:
-            X = X.to(dtype=torch.float32)
-
-        if not isinstance(y, torch.Tensor):
-            y = torch.tensor(y, dtype=torch.float32)
-        else:
-            y = y.to(dtype=torch.float32)
-            
-        X = X.to(self.device)
-        y = y.to(self.device).reshape(-1, 1) # {-1, 1}
-        
-        # Маски для векторизованного расчета Loss
-        pos_mask = (y > 0)
-        neg_mask = (y < 0)
-        
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
-        
-        self.train()
-        for epoch in range(self.epochs):
-            optimizer.zero_grad()
-            
-            # Forward pass
-            outputs = self.forward(X)
-            
-            # --- Расчет Loss (строго по статье ур. 49) ---
-            
-            # 1. Hinge Loss для позитивных примеров (y=+1)
-            # Constraint: ξ >= 1 - (w*x + b)
-            loss_pos = torch.tensor(0.0, device=self.device)
-            if pos_mask.any():
-                out_pos = outputs[pos_mask]
-                loss_pos = self.weight_pos * torch.sum(torch.relu(1.0 - out_pos))
-            
-            # 2. Hinge Loss для негативных примеров (y=-1)
-            # Constraint: ξ >= (w*x + b) + kappa
-            loss_neg = torch.tensor(0.0, device=self.device)
-            if neg_mask.any():
-                out_neg = outputs[neg_mask]
-                loss_neg = self.weight_neg * torch.sum(torch.relu(out_neg + self.kappa))
-            
-            # 3. Регуляризация ||w||^2
-            l2_reg = 0.5 * torch.sum(self.w ** 2)
-            
-            # Итоговый лосс
-            loss = l2_reg + loss_pos + loss_neg
-            
-            loss.backward()
-            optimizer.step()
-
-        return self
-
-    # --- Свойства для безопасного извлечения весов в NumPy ---
-    @property
-    def w_cpu(self):
-        """Возвращает веса w как одномерный numpy array на CPU"""
-        return self.w.detach().cpu().numpy().flatten()
-    
-    @property
-    def b_cpu(self):
-        """Возвращает смещение b как скаляр на CPU"""
-        return self.b.detach().cpu().numpy().item()
+# class BinaryCSSVM_Primal_Torch(torch.nn.Module):
+#     """
+#     НЕИСПОЛЬЗУЕТСЯ - закомментировано.
+#     Решает ПРЯМУЮ задачу CS-SVM (Equation 49 из статьи) через SGD/Adam на GPU.
+#     """
+#
+#     def __init__(self, n_features, C_slack=1.0, C_pos=3.0, C_neg=2.0,
+#                  device="cuda", epochs=500, lr=0.01):
+#         super().__init__()
+#         self.device = device
+#         self.epochs = epochs
+#         self.lr = lr
+#
+#         # Параметры из статьи
+#         self.kappa = 1.0 / (2 * C_neg - 1)
+#
+#         # Коэффициенты штрафа (Equation 49)
+#         self.weight_pos = C_slack * C_pos
+#         self.weight_neg = C_slack / self.kappa
+#
+#         # Параметры модели (w и b)
+#         # Инициализируем маленькими случайными числами
+#         self.w = torch.nn.Parameter(torch.randn(n_features, 1, device=device) * 0.01)
+#         self.b = torch.nn.Parameter(torch.zeros(1, device=device))
+#
+#     def forward(self, x):
+#         return x @ self.w + self.b
+#
+#     def fit(self, X, y):
+#         # Конвертация данных на GPU
+#         # Если пришел numpy array, конвертируем в тензор
+#         if not isinstance(X, torch.Tensor):
+#             X = torch.tensor(X, dtype=torch.float32)
+#         else:
+#             X = X.to(dtype=torch.float32)
+#
+#         if not isinstance(y, torch.Tensor):
+#             y = torch.tensor(y, dtype=torch.float32)
+#         else:
+#             y = y.to(dtype=torch.float32)
+#
+#         X = X.to(self.device)
+#         y = y.to(self.device).reshape(-1, 1) # {-1, 1}
+#
+#         # Маски для векторизованного расчета Loss
+#         pos_mask = (y > 0)
+#         neg_mask = (y < 0)
+#
+#         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+#
+#         self.train()
+#         for epoch in range(self.epochs):
+#             optimizer.zero_grad()
+#
+#             # Forward pass
+#             outputs = self.forward(X)
+#
+#             # --- Расчет Loss (строго по статье ур. 49) ---
+#
+#             # 1. Hinge Loss для позитивных примеров (y=+1)
+#             # Constraint: ξ >= 1 - (w*x + b)
+#             loss_pos = torch.tensor(0.0, device=self.device)
+#             if pos_mask.any():
+#                 out_pos = outputs[pos_mask]
+#                 loss_pos = self.weight_pos * torch.sum(torch.relu(1.0 - out_pos))
+#
+#             # 2. Hinge Loss для негативных примеров (y=-1)
+#             # Constraint: ξ >= (w*x + b) + kappa
+#             loss_neg = torch.tensor(0.0, device=self.device)
+#             if neg_mask.any():
+#                 out_neg = outputs[neg_mask]
+#                 loss_neg = self.weight_neg * torch.sum(torch.relu(out_neg + self.kappa))
+#
+#             # 3. Регуляризация ||w||^2
+#             l2_reg = 0.5 * torch.sum(self.w ** 2)
+#
+#             # Итоговый лосс
+#             loss = l2_reg + loss_pos + loss_neg
+#
+#             loss.backward()
+#             optimizer.step()
+#
+#         return self
+#
+#     # --- Свойства для безопасного извлечения весов в NumPy ---
+#     @property
+#     def w_cpu(self):
+#         """Возвращает веса w как одномерный numpy array на CPU"""
+#         return self.w.detach().cpu().numpy().flatten()
+#
+#     @property
+#     def b_cpu(self):
+#         """Возвращает смещение b как скаляр на CPU"""
+#         return self.b.detach().cpu().numpy().item()
 
 
 class BinaryCSSVM_QP:
@@ -1121,8 +1122,10 @@ class MultilabelCSSVM_WSS:
 
 # class MultilabelCSSVM_QP:
 #     """
+#     НЕИСПОЛЬЗУЕТСЯ - закомментировано.
 #     Multilabel CS-SVM с One-vs-Rest стратегией.
 #     Использует Primal-форму на GPU для скорости.
+#     Использует BinaryCSSVM_Primal_Torch (тоже закомментирован).
 #     """
 #
 #     def __init__(self, num_classes, class_counts, total_samples,
