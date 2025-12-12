@@ -50,6 +50,7 @@ def test_new_cssvm():
         # Создаем модель
         model = OptimizedCSSVM(
             verbose=True,
+            normalize_data=True,  # Включаем нормализацию для WSS
             **config,
             **params
         )

@@ -30,7 +30,7 @@ class OptimizedCSSVM:
     
     def __init__(self, C_slack=1.0, C_pos=3.0, C_neg=2.0, 
                  use_wss=False, working_set_size=200, max_iter=1000, 
-                 tol=1e-3, verbose=False):
+                 tol=1e-3, verbose=False, normalize_data=False):
         """
         Args:
             C_slack: Параметр регуляризации C (slack penalty)
@@ -41,7 +41,10 @@ class OptimizedCSSVM:
             max_iter: Максимальное количество итераций
             tol: Толерантность для сходимости
             verbose: Выводить информацию о процессе обучения
+            normalize_data: Нормализовать данные (по умолчанию False для совместимости)
         """
+        
+        self.normalize_data = normalize_data
         # Проверка условий из статьи (уравнение 50)
         assert C_neg >= 1.0, f"C_neg должно быть >= 1, получено {C_neg}"
         min_c_pos = 2 * C_neg - 1
@@ -87,22 +90,26 @@ class OptimizedCSSVM:
         # Конвертируем метки в {-1, +1}
         y = np.where(y > 0, 1, -1).astype(np.float64)
         
-        # ИСПРАВЛЕНО: Нормализация данных для численной стабильности
-        # Это предотвращает слишком большие значения весов
-        X_mean = np.mean(X, axis=0)
-        X_std = np.std(X, axis=0)
-        X_std[X_std < 1e-8] = 1.0  # Предотвращаем деление на ноль
-        X_normalized = (X - X_mean) / X_std
+        # Нормализация данных (опционально)
+        X_to_use = X
+        self._is_normalized = False
         
-        # Сохраняем параметры нормализации для предсказаний
-        self._X_mean = X_mean
-        self._X_std = X_std
-        self._is_normalized = True
+        if self.normalize_data:
+            # Нормализация для численной стабильности
+            X_mean = np.mean(X, axis=0)
+            X_std = np.std(X, axis=0)
+            X_std[X_std < 1e-8] = 1.0  # Предотвращаем деление на ноль
+            X_to_use = (X - X_mean) / X_std
+            
+            # Сохраняем параметры нормализации для предсказаний
+            self._X_mean = X_mean
+            self._X_std = X_std
+            self._is_normalized = True
         
         if self.use_wss:
-            return self._fit_wss(X_normalized, y)
+            return self._fit_wss(X_to_use, y)
         else:
-            return self._fit_qp(X_normalized, y)
+            return self._fit_qp(X_to_use, y)
 
     def _fit_qp(self, X, y):
         """
