@@ -1446,7 +1446,7 @@ def main():
                     verbose=True,
                     adaptive_ws=True,
                     patience=50,  # –£–≤–µ–ª–∏—á–µ–Ω–æ - —Ç–µ–ø–µ—Ä—å early stopping –º–µ–Ω–µ–µ –∞–≥—Ä–µ—Å—Å–∏–≤–Ω—ã–π
-                    max_cache_size_mb=100
+                    max_cache_size_mb=1000
                 )
 
                 svm.fit(X_train_scaled, y_train_np)
@@ -1533,11 +1533,4 @@ def main():
         print(f"{name:<45} {m['f1_micro']:<10.4f} {m['f1_macro']:<10.4f} {m.get('map_at_5', 0):<10.4f} {m.get('ndcg_at_5', 0):<10.4f}")
 
 if __name__ == "__main__":
-    main()"# --- çéÇÄü éèíàåàáàêéÇÄççÄü êÖÄãàáÄñàü CS-SVM ---" 
-"" 
-"# ÑÆ°†¢´Ô•¨ ≠Æ¢„Ó ÆØ‚®¨®ß®‡Æ¢†≠≠„Ó ‡•†´®ß†Ê®Ó" 
-""  
-"# à¨ØÆ‡‚®‡„•¨ ≠Æ¢„Ó ‡•†´®ß†Ê®Ó"  
-"from cssvm_optimized import OptimizedCSSVM" 
-""  
-"# é°≠Æ¢´Ô•¨ ¨•‚Æ§ fit ¢ MultilabelCSSVM_WSS §´Ô ®·ØÆ´ÏßÆ¢†≠®Ô ≠Æ¢Æ© ‡•†´®ß†Ê®®" 
+    main()
