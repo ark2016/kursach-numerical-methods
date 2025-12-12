@@ -43,7 +43,7 @@ CONFIG = {
     "C_neg": 2.0,         # C_{-1}: стоимость FP (должно быть >= 1)
 
     # Baseline sklearn SVM
-    "run_sklearn_baseline": True,
+    "run_sklearn_baseline": False,  # Отключено - уже протестировано
     "sklearn_svm_C_values": [0.1, 1.0],  # Разные значения C для LinearSVC
     "use_scaler": True,  # StandardScaler перед sklearn SVM
 
