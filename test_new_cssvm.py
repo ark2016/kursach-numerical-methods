@@ -38,8 +38,8 @@ def test_new_cssvm():
     
     # Тестируем оба режима
     modes = [
-        ("QP Mode", {"use_wss": False}),
-        ("WSS Mode", {"use_wss": True, "working_set_size": 200, "max_iter": 500})
+        ("QP Mode", {"use_wss": False, "normalize_data": False}),
+        ("WSS Mode", {"use_wss": True, "working_set_size": 200, "max_iter": 500, "normalize_data": True})
     ]
     
     results = {}
@@ -50,7 +50,6 @@ def test_new_cssvm():
         # Создаем модель
         model = OptimizedCSSVM(
             verbose=True,
-            normalize_data=True,  # Включаем нормализацию для WSS
             **config,
             **params
         )
