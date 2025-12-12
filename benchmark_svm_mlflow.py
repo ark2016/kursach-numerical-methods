@@ -491,16 +491,18 @@ class BinaryCSSVM_WSS:
                 y[active_set], C_upper[active_set]
             )
 
-            # Early stopping check
-            if max_violation < best_violation - self.tol / 10:
+            # Early stopping check - менее агрессивный
+            # Требуем значительное улучшение (не просто любое)
+            if max_violation < best_violation * 0.95:  # 5% улучшение
                 best_violation = max_violation
                 patience_counter = 0
             else:
                 patience_counter += 1
 
-            if patience_counter >= self.patience:
+            # Early stopping только если действительно застряли И violation уже маленький
+            if patience_counter >= self.patience and max_violation < self.tol * 10:
                 if self.verbose:
-                    print(f"\nEarly stopping at iteration {iteration}")
+                    print(f"\nEarly stopping at iteration {iteration} (violation={max_violation:.6f})")
                 break
 
             # Adaptive working set size
@@ -538,7 +540,12 @@ class BinaryCSSVM_WSS:
     
     def _select_working_set_vectorized(self, alphas, gradients, y,
                                       C_upper, candidate_set, q):
-        """Векторизованный выбор working set."""
+        """
+        Векторизованный выбор working set.
+
+        ВАЖНО: Гарантируем наличие примеров обоих классов в working set,
+        иначе equality constraint sum(alpha*y)=0 вынудит alpha=0!
+        """
         if len(candidate_set) == 0:
             return np.array([], dtype=int)
 
@@ -564,18 +571,49 @@ class BinaryCSSVM_WSS:
         violations[at_upper] = np.maximum(0, yg[at_upper] - 1.0)
         violations[free] = np.abs(yg[free] - 1.0)
 
-        # Выбираем top-q
-        if len(candidates) <= q:
-            mask = violations > self.tol / 10
-            return candidates[mask]
-        else:
-            # Используем argpartition для эффективности (O(n) vs O(n log n))
-            threshold_idx = max(0, len(violations) - q)
-            top_indices = np.argpartition(violations, threshold_idx)[threshold_idx:]
+        # ИСПРАВЛЕНИЕ: Выбираем working set с балансом классов
+        # Разделяем кандидатов на положительные и отрицательные
+        pos_mask = y_c > 0
+        neg_mask = y_c < 0
 
-            # Фильтруем по минимальному нарушению
-            mask = violations[top_indices] > self.tol / 10
-            return candidates[top_indices[mask]]
+        pos_candidates = candidates[pos_mask]
+        neg_candidates = candidates[neg_mask]
+        pos_violations = violations[pos_mask]
+        neg_violations = violations[neg_mask]
+
+        # Выбираем top-q/2 из каждого класса (или все, если меньше)
+        half_q = max(q // 2, 10)  # Минимум 10 из каждого класса
+
+        selected = []
+
+        # Выбираем из положительного класса
+        if len(pos_candidates) > 0:
+            n_pos = min(half_q, len(pos_candidates))
+            if len(pos_candidates) <= n_pos:
+                pos_selected_mask = pos_violations > self.tol / 10
+                selected.append(pos_candidates[pos_selected_mask])
+            else:
+                threshold_idx = max(0, len(pos_violations) - n_pos)
+                top_pos = np.argpartition(pos_violations, threshold_idx)[threshold_idx:]
+                pos_selected_mask = pos_violations[top_pos] > self.tol / 10
+                selected.append(pos_candidates[top_pos[pos_selected_mask]])
+
+        # Выбираем из отрицательного класса
+        if len(neg_candidates) > 0:
+            n_neg = min(half_q, len(neg_candidates))
+            if len(neg_candidates) <= n_neg:
+                neg_selected_mask = neg_violations > self.tol / 10
+                selected.append(neg_candidates[neg_selected_mask])
+            else:
+                threshold_idx = max(0, len(neg_violations) - n_neg)
+                top_neg = np.argpartition(neg_violations, threshold_idx)[threshold_idx:]
+                neg_selected_mask = neg_violations[top_neg] > self.tol / 10
+                selected.append(neg_candidates[top_neg[neg_selected_mask]])
+
+        if len(selected) == 0:
+            return np.array([], dtype=int)
+
+        return np.concatenate(selected)
     
     def _solve_subproblem_cached(self, X, y, alphas, B, C_upper, gradients):
         """Решение подзадачи с кэшированием kernel matrix."""
@@ -1364,12 +1402,12 @@ def main():
                     C_slack=CONFIG['C_slack'],
                     C_pos_base=CONFIG['C_pos'],
                     C_neg_base=CONFIG['C_neg'],
-                    working_set_size=200,  # Начальный размер (будет адаптироваться)
-                    max_iter=2000,  # Увеличено с 1000 для лучшей сходимости
+                    working_set_size=300,  # Увеличено для лучшего покрытия классов
+                    max_iter=2000,
                     verbose=True,
-                    adaptive_ws=True,  # Адаптивный размер working set
-                    patience=15,  # Увеличено с 10 для более тщательной оптимизации
-                    max_cache_size_mb=100  # Максимальный размер кэша
+                    adaptive_ws=True,
+                    patience=50,  # Увеличено - теперь early stopping менее агрессивный
+                    max_cache_size_mb=100
                 )
 
                 svm.fit(X_train_scaled, y_train_np)
