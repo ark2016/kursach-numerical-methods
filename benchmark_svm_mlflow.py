@@ -511,7 +511,7 @@ class BinaryCSSVM_WSS:
                     max_violation, len(B), current_q
                 )
 
-            if self.verbose and iteration % 10 == 0:
+            if self.verbose and iteration % 100 == 0:
                 cache_rate = (self._cache_hits /
                             (self._cache_hits + self._cache_misses + 1e-8))
                 print(f"Iter {iteration}: violation={max_violation:.6f}, "
@@ -1007,6 +1007,11 @@ class MultilabelCSSVM_WSS:
         self.num_classes = num_classes
         self.C_slack = C_slack
         self.C_neg_base = C_neg_base
+
+        # κ для CS-SVM
+        self.kappa = 1.0 / (2 * C_neg_base - 1)
+        # Порог для предсказания: середина между +1 и -κ
+        self.threshold = (1.0 - self.kappa) / 2.0
         self.working_set_size = working_set_size
         self.max_iter = max_iter
         self.verbose = verbose
@@ -1069,12 +1074,19 @@ class MultilabelCSSVM_WSS:
     def decision_function(self, X):
         """Вычисление решающей функции для всех классов"""
         return np.dot(X, self.w) + self.b
-    
+
     def predict(self, X):
-        """Бинарное предсказание (threshold = 0)"""
+        """
+        Бинарное предсказание с правильным порогом для CS-SVM.
+
+        Для CS-SVM:
+        - Положительный класс: w^T x + b >= 1
+        - Отрицательный класс: w^T x + b <= -κ
+        - Порог: (1 - κ) / 2
+        """
         scores = self.decision_function(X)
-        return (scores > 0).astype(np.float32)
-    
+        return (scores > self.threshold).astype(np.float32)
+
     def predict_proba(self, X):
         """Возвращает scores"""
         return self.decision_function(X)
@@ -1418,11 +1430,13 @@ def main():
                 pred_bin = svm.predict(X_test_scaled)
 
                 # ДИАГНОСТИКА: Проверяем распределение скоров
+                print(f"  CS-SVM threshold: {svm.threshold:.4f} (κ={svm.kappa:.4f})")
                 print(f"  Decision function distribution:")
                 print(f"    Min: {np.min(y_scores):.6f}, Max: {np.max(y_scores):.6f}")
                 print(f"    Mean: {np.mean(y_scores):.6f}, Std: {np.std(y_scores):.6f}")
                 print(f"    Median: {np.median(y_scores):.6f}")
-                print(f"    % of positive scores: {100 * np.mean(y_scores > 0):.2f}%")
+                print(f"    % scores > 0: {100 * np.mean(y_scores > 0):.2f}%")
+                print(f"    % scores > threshold ({svm.threshold:.4f}): {100 * np.mean(y_scores > svm.threshold):.2f}%")
                 print(f"  Bias (b) distribution:")
                 print(f"    Min: {np.min(svm.b):.6f}, Max: {np.max(svm.b):.6f}")
                 print(f"    Mean: {np.mean(svm.b):.6f}, Median: {np.median(svm.b):.6f}")
