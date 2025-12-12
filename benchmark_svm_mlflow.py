@@ -1533,4 +1533,11 @@ def main():
         print(f"{name:<45} {m['f1_micro']:<10.4f} {m['f1_macro']:<10.4f} {m.get('map_at_5', 0):<10.4f} {m.get('ndcg_at_5', 0):<10.4f}")
 
 if __name__ == "__main__":
-    main()
+    main()"# --- НОВАЯ ОПТИМИЗИРОВАННАЯ РЕАЛИЗАЦИЯ CS-SVM ---" 
+"" 
+"# Добавляем новую оптимизированную реализацию" 
+""  
+"# Импортируем новую реализацию"  
+"from cssvm_optimized import OptimizedCSSVM" 
+""  
+"# Обновляем метод fit в MultilabelCSSVM_WSS для использования новой реализации" 
