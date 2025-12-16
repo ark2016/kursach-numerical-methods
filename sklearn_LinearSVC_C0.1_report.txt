@@ -1,38 +1,38 @@
-Encoder: fyaronskiy/ruRoberta-large-ru-go-emotions
+Encoder: My_LoRA_Ark2016
 Classifier: LinearSVC_C0.1
 
                 precision    recall  f1-score   support
 
-    admiration       0.67      0.34      0.45       504
-     amusement       0.80      0.69      0.74       264
-         anger       0.63      0.10      0.17       198
-     annoyance       0.00      0.00      0.00       320
-      approval       0.74      0.08      0.15       351
-        caring       0.45      0.07      0.12       135
-     confusion       0.55      0.14      0.22       153
-     curiosity       0.51      0.31      0.38       284
-        desire       0.51      0.25      0.34        83
-disappointment       0.00      0.00      0.00       151
-   disapproval       0.46      0.08      0.13       267
-       disgust       0.67      0.05      0.09       123
- embarrassment       0.00      0.00      0.00        37
-    excitement       0.53      0.08      0.14       103
-          fear       0.64      0.21      0.31        78
-     gratitude       0.96      0.86      0.91       352
+    admiration       0.64      0.68      0.66       504
+     amusement       0.76      0.83      0.79       264
+         anger       0.47      0.41      0.44       198
+     annoyance       0.31      0.36      0.34       320
+      approval       0.36      0.38      0.37       351
+        caring       0.39      0.29      0.33       135
+     confusion       0.38      0.49      0.43       153
+     curiosity       0.50      0.53      0.51       284
+        desire       0.54      0.40      0.46        83
+disappointment       0.26      0.24      0.25       151
+   disapproval       0.33      0.29      0.31       267
+       disgust       0.55      0.41      0.47       123
+ embarrassment       0.52      0.35      0.42        37
+    excitement       0.44      0.33      0.38       103
+          fear       0.68      0.62      0.64        78
+     gratitude       0.91      0.90      0.90       352
          grief       0.00      0.00      0.00         6
-           joy       0.72      0.32      0.45       161
-          love       0.82      0.76      0.79       238
-   nervousness       0.10      0.09      0.09        23
-      optimism       0.76      0.32      0.45       186
-         pride       0.22      0.12      0.16        16
-   realization       0.50      0.01      0.01       145
-        relief       0.09      0.09      0.09        11
-       remorse       0.40      0.34      0.37        56
-       sadness       0.69      0.30      0.42       156
-      surprise       0.63      0.21      0.31       141
-       neutral       0.63      0.55      0.59      1787
+           joy       0.52      0.55      0.53       161
+          love       0.76      0.81      0.78       238
+   nervousness       0.30      0.30      0.30        23
+      optimism       0.53      0.49      0.51       186
+         pride       0.33      0.12      0.18        16
+   realization       0.21      0.20      0.21       145
+        relief       0.20      0.27      0.23        11
+       remorse       0.59      0.77      0.67        56
+       sadness       0.53      0.49      0.51       156
+      surprise       0.59      0.47      0.52       141
+       neutral       0.59      0.73      0.65      1787
 
-     micro avg       0.67      0.36      0.47      6329
-     macro avg       0.49      0.23      0.28      6329
-  weighted avg       0.60      0.36      0.41      6329
-   samples avg       0.40      0.38      0.38      6329
+     micro avg       0.55      0.58      0.56      6329
+     macro avg       0.47      0.45      0.46      6329
+  weighted avg       0.54      0.58      0.56      6329
+   samples avg       0.56      0.60      0.57      6329

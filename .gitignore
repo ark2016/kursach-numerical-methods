@@ -6,3 +6,4 @@ classification_report.txt
 *.pt
 __pycache__/
 .*/
+*.md

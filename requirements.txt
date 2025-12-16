@@ -7,6 +7,10 @@ peft>=0.6.0
 # Sklearn
 scikit-learn>=1.3.0
 
+# Optimization solvers (for CS-SVM)
+cvxopt>=1.3.0
+osqp>=0.6.2
+
 # MLFlow & storage
 mlflow>=2.10.0
 boto3>=1.28.0
