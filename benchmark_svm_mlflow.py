@@ -21,11 +21,9 @@ from scipy import sparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.metrics import compute_all_metrics_at_k
 from cvxopt import spmatrix
-
-# Отключаем вывод cvxopt
 solvers.options['show_progress'] = False
 
-# --- КОНФИГУРАЦИЯ ---
+#  КОНФИГУРАЦИЯ 
 CONFIG = {
     "dataset_name": "seara/ru_go_emotions",
     "batch_size_embed": 64,
@@ -45,10 +43,7 @@ CONFIG = {
     # Baseline sklearn SVM
     "run_sklearn_baseline": False,  # Отключено - уже протестировано
     "sklearn_svm_C_values": [0.1, 1.0],  # Разные значения C для LinearSVC
-    # ВАЖНО: Эмбеддинги уже нормализованы (L2 norm) на строке 1148!
-    # StandardScaler поверх нормализованных эмбеддингов может навредить вычислению bias.
-    # Попробуйте сначала с False, если получаете все F1=0.
-    "use_scaler": False,  # StandardScaler перед SVM (было True - вызывало проблемы!)
+    "use_scaler": False,  # StandardScaler перед SVM
 
     # Metrics @k settings
     "k_values": [1, 3, 5, 10],
@@ -66,8 +61,6 @@ MODELS = {
     "Baseline_ruBert": "ai-forever/ruBert-large",
     "Foreign_ruRoberta": "fyaronskiy/ruRoberta-large-ru-go-emotions",
     "My_LoRA_Ark2016": "Ark2016/ruBert-large-emotions-lora",
-    # Повторяющаяся модель (дубликат Foreign_ruRoberta)
-    # "fyaronskiy/ruRoberta-large-ru-go-emotions": "fyaronskiy/ruRoberta-large-ru-go-emotions"
 }
 
 # Настройка окружения для MLFlow/Boto3
@@ -81,100 +74,99 @@ os.environ["MLFLOW_S3_IGNORE_TLS"] = "true"
 # Создаем папку для кэша
 os.makedirs(CONFIG["cache_dir"], exist_ok=True)
 
-# class BinaryCSSVM_Primal_Torch(torch.nn.Module):
-#     """
-#     НЕИСПОЛЬЗУЕТСЯ - закомментировано.
-#     Решает ПРЯМУЮ задачу CS-SVM (Equation 49 из статьи) через SGD/Adam на GPU.
-#     """
-#
-#     def __init__(self, n_features, C_slack=1.0, C_pos=3.0, C_neg=2.0,
-#                  device="cuda", epochs=500, lr=0.01):
-#         super().__init__()
-#         self.device = device
-#         self.epochs = epochs
-#         self.lr = lr
-#
-#         # Параметры из статьи
-#         self.kappa = 1.0 / (2 * C_neg - 1)
-#
-#         # Коэффициенты штрафа (Equation 49)
-#         self.weight_pos = C_slack * C_pos
-#         self.weight_neg = C_slack / self.kappa
-#
-#         # Параметры модели (w и b)
-#         # Инициализируем маленькими случайными числами
-#         self.w = torch.nn.Parameter(torch.randn(n_features, 1, device=device) * 0.01)
-#         self.b = torch.nn.Parameter(torch.zeros(1, device=device))
-#
-#     def forward(self, x):
-#         return x @ self.w + self.b
-#
-#     def fit(self, X, y):
-#         # Конвертация данных на GPU
-#         # Если пришел numpy array, конвертируем в тензор
-#         if not isinstance(X, torch.Tensor):
-#             X = torch.tensor(X, dtype=torch.float32)
-#         else:
-#             X = X.to(dtype=torch.float32)
-#
-#         if not isinstance(y, torch.Tensor):
-#             y = torch.tensor(y, dtype=torch.float32)
-#         else:
-#             y = y.to(dtype=torch.float32)
-#
-#         X = X.to(self.device)
-#         y = y.to(self.device).reshape(-1, 1) # {-1, 1}
-#
-#         # Маски для векторизованного расчета Loss
-#         pos_mask = (y > 0)
-#         neg_mask = (y < 0)
-#
-#         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
-#
-#         self.train()
-#         for epoch in range(self.epochs):
-#             optimizer.zero_grad()
-#
-#             # Forward pass
-#             outputs = self.forward(X)
-#
-#             # --- Расчет Loss (строго по статье ур. 49) ---
-#
-#             # 1. Hinge Loss для позитивных примеров (y=+1)
-#             # Constraint: ξ >= 1 - (w*x + b)
-#             loss_pos = torch.tensor(0.0, device=self.device)
-#             if pos_mask.any():
-#                 out_pos = outputs[pos_mask]
-#                 loss_pos = self.weight_pos * torch.sum(torch.relu(1.0 - out_pos))
-#
-#             # 2. Hinge Loss для негативных примеров (y=-1)
-#             # Constraint: ξ >= (w*x + b) + kappa
-#             loss_neg = torch.tensor(0.0, device=self.device)
-#             if neg_mask.any():
-#                 out_neg = outputs[neg_mask]
-#                 loss_neg = self.weight_neg * torch.sum(torch.relu(out_neg + self.kappa))
-#
-#             # 3. Регуляризация ||w||^2
-#             l2_reg = 0.5 * torch.sum(self.w ** 2)
-#
-#             # Итоговый лосс
-#             loss = l2_reg + loss_pos + loss_neg
-#
-#             loss.backward()
-#             optimizer.step()
-#
-#         return self
-#
-#     # --- Свойства для безопасного извлечения весов в NumPy ---
-#     @property
-#     def w_cpu(self):
-#         """Возвращает веса w как одномерный numpy array на CPU"""
-#         return self.w.detach().cpu().numpy().flatten()
-#
-#     @property
-#     def b_cpu(self):
-#         """Возвращает смещение b как скаляр на CPU"""
-#         return self.b.detach().cpu().numpy().item()
+class BinaryCSSVM_Primal_Torch(torch.nn.Module):
+    """
+    Решает ПРЯМУЮ задачу CS-SVM (Equation 49 из статьи) через SGD/Adam на GPU.
+    """
+
+    def __init__(self, n_features, C_slack=1.0, C_pos=3.0, C_neg=2.0,
+                 device="cuda", epochs=500, lr=0.01):
+        super().__init__()
+        self.device = device
+        self.epochs = epochs
+        self.lr = lr
+
+        # Параметры из статьи
+        self.kappa = 1.0 / (2 * C_neg - 1)
+
+        # Коэффициенты штрафа (Equation 49)
+        self.weight_pos = C_slack * C_pos
+        self.weight_neg = C_slack / self.kappa
+
+        # Параметры модели (w и b)
+        # Инициализируем маленькими случайными числами
+        self.w = torch.nn.Parameter(torch.randn(n_features, 1, device=device) * 0.01)
+        self.b = torch.nn.Parameter(torch.zeros(1, device=device))
+
+    def forward(self, x):
+        return x @ self.w + self.b
+
+    def fit(self, X, y):
+        # Конвертация данных на GPU
+        # Если пришел numpy array, конвертируем в тензор
+        if not isinstance(X, torch.Tensor):
+            X = torch.tensor(X, dtype=torch.float32)
+        else:
+            X = X.to(dtype=torch.float32)
+
+        if not isinstance(y, torch.Tensor):
+            y = torch.tensor(y, dtype=torch.float32)
+        else:
+            y = y.to(dtype=torch.float32)
+
+        X = X.to(self.device)
+        y = y.to(self.device).reshape(-1, 1) # {-1, 1}
+
+        # Маски для векторизованного расчета Loss
+        pos_mask = (y > 0)
+        neg_mask = (y < 0)
+
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+
+        self.train()
+        for epoch in range(self.epochs):
+            optimizer.zero_grad()
+
+            # Forward pass
+            outputs = self.forward(X)
+
+            #  Расчет Loss (строго по статье ур. 49) 
+
+            # 1. Hinge Loss для позитивных примеров (y=+1)
+            # Constraint: ξ >= 1 - (w*x + b)
+            loss_pos = torch.tensor(0.0, device=self.device)
+            if pos_mask.any():
+                out_pos = outputs[pos_mask]
+                loss_pos = self.weight_pos * torch.sum(torch.relu(1.0 - out_pos))
+
+            # 2. Hinge Loss для негативных примеров (y=-1)
+            # Constraint: ξ >= (w*x + b) + kappa
+            loss_neg = torch.tensor(0.0, device=self.device)
+            if neg_mask.any():
+                out_neg = outputs[neg_mask]
+                loss_neg = self.weight_neg * torch.sum(torch.relu(out_neg + self.kappa))
+
+            # 3. Регуляризация ||w||^2
+            l2_reg = 0.5 * torch.sum(self.w ** 2)
+
+            # Итоговый лосс
+            loss = l2_reg + loss_pos + loss_neg
+
+            loss.backward()
+            optimizer.step()
+
+        return self
+
+    #  Свойства для безопасного извлечения весов в NumPy 
+    @property
+    def w_cpu(self):
+        """Возвращает веса w как одномерный numpy array на CPU"""
+        return self.w.detach().cpu().numpy().flatten()
+
+    @property
+    def b_cpu(self):
+        """Возвращает смещение b как скаляр на CPU"""
+        return self.b.detach().cpu().numpy().item()
 
 
 class BinaryCSSVM_QP:
@@ -230,32 +222,25 @@ class BinaryCSSVM_QP:
     def fit(self, X, y):
         """
         Обучение CS-SVM через решение двойственной задачи квадратичного программирования.
-        ИСПРАВЛЕНО: Использование разреженных матриц для G.
         """
         n_samples, n_features = X.shape
 
         # Конвертируем метки в {-1, +1}
         y = np.where(y > 0, 1, -1).astype(np.float64)
 
-        # ----------------------------------------------------------------------
         # 1. Матрица P (Kernel Matrix * Labels)
         # P остается плотной. Для 43k сэмплов она займет 64+ ГБ RAM.
         # Если упадет с MemoryError, придется переходить на Primal SGD.
-        # ----------------------------------------------------------------------
         K = np.dot(X, X.T)
         YY = np.outer(y, y)
         P = YY * K
         P = P + 1e-8 * np.eye(n_samples) # Численная стабильность
-        
         P_cvx = matrix(P.astype(np.float64))
         
-        # ----------------------------------------------------------------------
         # 2. Вектор q
-        # ----------------------------------------------------------------------
         q = np.where(y > 0, 1.0, self.kappa)
         q_cvx = matrix(-q.astype(np.float64))
 
-        # ----------------------------------------------------------------------
         # 3. Ограничения Gx <= h (Box constraints) через Sparse Matrix
         #
         # Нам нужно закодировать:
@@ -265,8 +250,6 @@ class BinaryCSSVM_QP:
         # Матрица G (2N x N) будет иметь вид:
         # [-I ]
         # [ I ]
-        # ----------------------------------------------------------------------
-        
         # Значения: N раз по -1.0, затем N раз по 1.0
         values = [-1.0] * n_samples + [1.0] * n_samples
         
@@ -286,15 +269,12 @@ class BinaryCSSVM_QP:
         
         h_cvx = matrix(h_combined.astype(np.float64))
 
-        # ----------------------------------------------------------------------
         # 4. Равенство A x = b (сумма alpha * y = 0)
-        # ----------------------------------------------------------------------
         A_eq = matrix(y.reshape(1, -1).astype(np.float64))
         b_eq = matrix(np.zeros(1).astype(np.float64))
 
-        # ----------------------------------------------------------------------
         # 5. Решение
-        # ----------------------------------------------------------------------
+        
         # Чистим память перед запуском солвера (удаляем тяжелые numpy массивы) иначе падает с превышением INT64
         del K, YY, P, values, rows, cols
         import gc
@@ -418,7 +398,6 @@ class BinaryCSSVM_WSS:
         """Обучение через Working Set Selection с оптимизациями."""
         n_samples, n_features = X.shape
         
-        # ДОБАВИТЬ: Проверка на вырожденные случаи
         if n_samples < 10:
             warnings.warn("Too few samples, falling back to simple QP solve")
             # Используем простое QP решение
@@ -570,7 +549,6 @@ class BinaryCSSVM_WSS:
         at_upper = alpha_c > C_c - eps
         free = ~at_lower & ~at_upper
 
-        # ИСПРАВЛЕНО: Правильные KKT нарушения для dual задачи
         # gradients = q - Qα, поэтому ∇f = -gradients
         # При α=0: нарушение если ∇f < 0, т.е. -gradients < 0, т.е. gradients > 0
         # При α=C: нарушение если ∇f > 0, т.е. -gradients > 0, т.е. gradients < 0
@@ -580,7 +558,6 @@ class BinaryCSSVM_WSS:
         violations[at_upper] = np.maximum(0, -grad_c[at_upper])  # Хотим grad >= 0
         violations[free] = np.abs(grad_c[free])  # Хотим grad = 0
 
-        # ИСПРАВЛЕНИЕ: Выбираем working set с балансом классов
         # Разделяем кандидатов на положительные и отрицательные
         pos_mask = y_c > 0
         neg_mask = y_c < 0
@@ -669,8 +646,7 @@ class BinaryCSSVM_WSS:
         reg_eps = max(1e-8, -min_eig + 1e-6) if min_eig < 0 else 1e-8
         Q_BB_reg = Q_BB + reg_eps * np.eye(q)
 
-        # ИСПРАВЛЕНО: Правильный линейный коэффициент для QP подзадачи
-        #
+
         # Двойственная задача: min_α 1/2 α^T Q α - q^T α
         # где Q_ij = y_i y_j K_ij, q_i = 1 (y=+1) или κ (y=-1)
         #
@@ -687,7 +663,6 @@ class BinaryCSSVM_WSS:
 
         p = -gradients[B] - Q_BB @ alphas[B]
 
-        # ВАЖНО: правильное вычисление c для equality constraint
         # Constraint: sum(alpha[B] * y[B]) = -sum(alpha[not B] * y[not B])
         all_indices = np.arange(len(alphas))
         not_B = np.setdiff1d(all_indices, B)
@@ -697,7 +672,6 @@ class BinaryCSSVM_WSS:
         u_box = C_upper[B]
 
         # OSQP setup с улучшенными настройками
-        # ИСПРАВЛЕНО: A должна включать equality constraint И box constraints!
         # Формулировка OSQP: l <= A*x <= u
         # A = [y_B^T]  - equality constraint (1 row)
         #     [I_q]    - identity для box constraints (q rows)
@@ -722,13 +696,12 @@ class BinaryCSSVM_WSS:
                 eps_rel=1e-4,
                 max_iter=4000,
                 polish=True,
-                adaptive_rho=True,  # Улучшает сходимость
-                check_termination=25  # Проверяем сходимость чаще
+                adaptive_rho=True,
+                check_termination=25
             )
             
             results = m.solve()
 
-            # ДИАГНОСТИКА: выводим информацию о решении
             if self.verbose and np.random.random() < 0.01:  # 1% выборка
                 print(f"\n  OSQP debug: status={results.info.status}, "
                       f"p_range=[{p.min():.4f}, {p.max():.4f}], "
@@ -804,7 +777,6 @@ class BinaryCSSVM_WSS:
         at_upper = alphas > C_upper - eps
         free = ~at_lower & ~at_upper
 
-        # ИСПРАВЛЕНО: Правильные KKT нарушения для dual
         violations = np.zeros(len(alphas))
         violations[at_lower] = np.maximum(0, gradients[at_lower])  # Хотим grad <= 0
         violations[at_upper] = np.maximum(0, -gradients[at_upper])  # Хотим grad >= 0
@@ -890,7 +862,6 @@ class BinaryCSSVM_WSS:
 
     def _fit_simple_qp(self, X, y):
         """Простое QP решение для малых наборов данных."""
-        # Используем стандартный QP solver для малых задач
         simple_svm = BinaryCSSVM_QP(
             C_slack=self.C,
             C_pos=self.C_pos,
@@ -912,11 +883,9 @@ class BinaryCSSVM_WSS:
         sv_threshold = 1e-5
         sv_indices = alphas > sv_threshold
 
-        # ДОБАВИТЬ: Проверка количества SV
         n_sv = np.sum(sv_indices)
         if n_sv == 0:
             warnings.warn("No support vectors found! Model may be degenerate.")
-            # Fallback: используем все точки
             sv_indices = np.ones(len(alphas), dtype=bool)
 
         if self.verbose:
@@ -929,7 +898,6 @@ class BinaryCSSVM_WSS:
         # Вычисляем w
         self.w = np.sum((alphas * y).reshape(-1, 1) * X, axis=0)
 
-        # ДОБАВИТЬ: Проверка нормы w
         w_norm = np.linalg.norm(self.w)
         if w_norm < 1e-10:
             warnings.warn("Weight vector has near-zero norm! Model may be degenerate.")
@@ -937,7 +905,6 @@ class BinaryCSSVM_WSS:
         # Вычисляем b
         self.b = self._compute_bias(X, y, alphas, C_upper)
         
-        # ДОБАВИТЬ: Финальная проверка KKT на train set
         if self.verbose:
             train_violations = self._compute_kkt_violations(X, y, alphas, C_upper)
             print(f"  Final KKT violations: max={np.max(train_violations):.6f}, "
@@ -989,7 +956,7 @@ class BinaryCSSVM_WSS:
                 wx = np.dot(self.w, X[i])
                 if y[i] > 0:
                     b_estimates.append(1.0 - wx)
-                else:  # y[i] < 0
+                else:
                     b_estimates.append(-self.kappa - wx)
 
             return np.mean(b_estimates)
@@ -1076,10 +1043,10 @@ class MultilabelCSSVM_WSS:
                 C_neg=self.C_neg_base,
                 working_set_size=self.working_set_size,
                 max_iter=self.max_iter,
-                tol=5e-3,  # Ослаблено с 1e-3 для более быстрой и надежной сходимости
-                shrinking=False,  # Отключено для надежной сходимости
+                tol=5e-3,  
+                shrinking=False,
                 verbose=self.verbose,
-                adaptive_ws=False,  # Отключено для стабильности
+                adaptive_ws=False,
                 patience=self.patience,
                 max_cache_size_mb=self.max_cache_size_mb
             )
@@ -1089,8 +1056,6 @@ class MultilabelCSSVM_WSS:
 
             self.w[:, c] = clf.w
             self.b[c] = clf.b
-
-            # ДИАГНОСТИКА: логируем параметры каждого класса
             if self.verbose:
                 n_pos = np.sum(y_binary > 0)
                 n_neg = np.sum(y_binary < 0)
@@ -1122,7 +1087,6 @@ class MultilabelCSSVM_WSS:
 
 # class MultilabelCSSVM_QP:
 #     """
-#     НЕИСПОЛЬЗУЕТСЯ - закомментировано.
 #     Multilabel CS-SVM с One-vs-Rest стратегией.
 #     Использует Primal-форму на GPU для скорости.
 #     Использует BinaryCSSVM_Primal_Torch (тоже закомментирован).
@@ -1179,9 +1143,6 @@ class MultilabelCSSVM_WSS:
 #
 #             clf.fit(X, y_binary)
 #             self.classifiers.append(clf)
-#
-#             # --- ИСПРАВЛЕНИЕ ЗДЕСЬ ---
-#             # Берем веса через свойство w_cpu, которое делает .detach().cpu().numpy()
 #             self.w[:, c] = clf.w_cpu
 #             self.b[c] = clf.b_cpu
 #
@@ -1433,10 +1394,6 @@ def main():
                 print(f"  Dataset size: {total_samples} samples, {len(label_list)} classes")
 
                 # Создаём и обучаем CS-SVM через WSS (Working Set Selection) с оптимизациями
-                # ПАРАМЕТРЫ ДЛЯ ОТЛАДКИ:
-                # - Если F1=0: попробуйте max_iter=2000-5000, tol=1e-2
-                # - Если не сходится: попробуйте отключить shrinking=False, adaptive_ws=False
-                # - Увеличьте patience=20 для более тщательной оптимизации
                 svm = MultilabelCSSVM_WSS(
                     num_classes=len(label_list),
                     class_counts=class_counts,
@@ -1444,22 +1401,19 @@ def main():
                     C_slack=CONFIG['C_slack'],
                     C_pos_base=CONFIG['C_pos'],
                     C_neg_base=CONFIG['C_neg'],
-                    working_set_size=300,  # Увеличено для лучшего покрытия классов
+                    working_set_size=300,
                     max_iter=2000,
                     verbose=True,
                     adaptive_ws=True,
-                    patience=50,  # Увеличено - теперь early stopping менее агрессивный
+                    patience=50,
                     max_cache_size_mb=1000
                 )
 
                 svm.fit(X_train_scaled, y_train_np)
 
                 print("Evaluating CS-SVM...")
-                # Предсказания
                 y_scores = svm.decision_function(X_test_scaled)
                 pred_bin = svm.predict(X_test_scaled)
-
-                # ДИАГНОСТИКА: Проверяем распределение скоров
                 print(f"  CS-SVM threshold: {svm.threshold:.4f} (κ={svm.kappa:.4f})")
                 print(f"  Decision function distribution:")
                 print(f"    Min: {np.min(y_scores):.6f}, Max: {np.max(y_scores):.6f}")
@@ -1471,8 +1425,6 @@ def main():
                 print(f"    Min: {np.min(svm.b):.6f}, Max: {np.max(svm.b):.6f}")
                 print(f"    Mean: {np.mean(svm.b):.6f}, Median: {np.median(svm.b):.6f}")
                 print(f"  Predicted labels sum: {pred_bin.sum():.0f} (out of {pred_bin.size} total predictions)")
-
-                # Метрики
                 metrics = {
                     "f1_micro": f1_score(y_test_np, pred_bin, average='micro'),
                     "f1_macro": f1_score(y_test_np, pred_bin, average='macro'),
@@ -1512,8 +1464,6 @@ def main():
                 print(f"CS-SVM WSS run for {model_friendly_name} completed.")
 
             if CONFIG["run_sklearn_baseline"]:
-                # ВАЖНО: Передаём УЖЕ отмасштабированные данные (X_train_scaled, X_test_scaled)
-                # чтобы все эксперименты шли на равных условиях
                 sklearn_results = train_sklearn_baselines(
                     X_train_scaled, y_train, X_test_scaled, y_test,
                     target_names_str, model_friendly_name
